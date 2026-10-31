@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <mach/mach_error.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
@@ -33,15 +34,64 @@ static char g_log_path[1024];
 // ---- guest address space
 // Everything readable/writable from the start: macOS pages are 16K but the guest maps at 4K granularity.
 // Untouched pages cost nothing, so the 64 GB window (rt.h GUEST_HI) is only address space.
+// What already sits at addr (for the log when the window can't be claimed).
+static void report_occupant(uint64_t addr) {
+    vm_address_t r = (vm_address_t)addr;
+    vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = vm_region_recurse_64(mach_task_self(), &r, &size, &depth, (vm_region_recurse_info_t)&info, &count);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[plat]   nothing mapped at or above %llx (vm_region: %s)\n", (unsigned long long)addr,
+                mach_error_string(kr));
+        return;
+    }
+    fprintf(stderr, "[plat]   next mapping at or above %llx: %llx-%llx (%llu MB), prot %d/%d, user_tag %u, share_mode %d\n",
+            (unsigned long long)addr, (unsigned long long)r, (unsigned long long)(r + size),
+            (unsigned long long)(size >> 20), info.protection, info.max_protection, info.user_tag, info.share_mode);
+}
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
+    const char *tries = getenv("ARK_REEXEC");  // (runtime/main.c re-executes up to 20 times when this fails)
+    bool say = !tries || atoi(tries) >= 19;
     vm_address_t a = lo;
-    return vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED) == KERN_SUCCESS && a == lo;
+    kern_return_t kr = vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED);
+    if (kr == KERN_SUCCESS && a == lo) return true;
+    if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), a, hi - lo);
+    if (say)
+        fprintf(stderr, "[plat] reserving %llx-%llx in one piece failed: %s; trying 1 GB pieces\n", (unsigned long long)lo,
+                (unsigned long long)hi, mach_error_string(kr));
+    // Claim it piece by piece: works where one request this large is refused, and names what is in the way if a
+    // piece is already taken.
+    const uint64_t step = 1ull << 30;
+    for (uint64_t p = lo; p < hi; p += step) {
+        uint64_t n = hi - p < step ? hi - p : step;
+        a = (vm_address_t)p;
+        kr = vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED);
+        if (kr == KERN_SUCCESS && a == p) continue;
+        if (say) {
+            fprintf(stderr, "[plat] piece %llx-%llx: %s\n", (unsigned long long)p, (unsigned long long)(p + n),
+                    mach_error_string(kr));
+            report_occupant(p);
+        }
+        if (p > lo) vm_deallocate(mach_task_self(), (vm_address_t)lo, p - lo);
+        return false;
+    }
+    fprintf(stderr, "[plat] reserved %llx-%llx in 1 GB pieces\n", (unsigned long long)lo, (unsigned long long)hi);
+    return true;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     vm_address_t a = lo;
-    return vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+    if (vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS) return true;
+    for (uint64_t p = lo, step = 1ull << 30; p < hi; p += step) {  // (as plat_reserve_guest: in pieces)
+        a = (vm_address_t)p;
+        if (vm_allocate(mach_task_self(), &a, hi - p < step ? hi - p : step, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS)
+            return false;
+    }
+    return true;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
