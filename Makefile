@@ -109,11 +109,20 @@ $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 
 rt: $(RT_OBJ)
 
+# export the runtime's symbols for backtraces (plat_symbol): -rdynamic on Linux, -export_dynamic on macOS
+ifeq ($(OS),Windows_NT)
+EXPORT_DYN :=
+else ifeq ($(shell uname -s),Darwin)
+EXPORT_DYN := -Wl,-export_dynamic
+else
+EXPORT_DYN := -rdynamic
+endif
+
 ark: $(EXE)
 # (the object list goes in a response file: ~1,800 paths are over Windows' command-line limit)
 $(EXE): $(RT_OBJ) $(GEN_OBJ)
 	$(file >$(B)/link.rsp,$(RT_OBJ) $(GEN_OBJ))
-	$(CC) -o $@ @$(B)/link.rsp $(LDLIBS) $(if $(filter Windows_NT,$(OS)),,$(if $(filter Darwin,$(shell uname -s)),-Wl,-export_dynamic,-rdynamic))
+	$(CC) -o $@ @$(B)/link.rsp $(LDLIBS) $(EXPORT_DYN)
 
 mkromfs: $(B)/mkromfs
 $(B)/mkromfs: tools/mkromfs/mkromfs.c runtime/romfs_build.c
