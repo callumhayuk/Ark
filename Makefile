@@ -119,9 +119,14 @@ EXPORT_DYN := -rdynamic
 endif
 
 ark: $(EXE)
-# (the object list goes in a response file: ~1,800 paths are over Windows' command-line limit)
+# (the object list goes in a response file: ~1,800 paths are over Windows' command-line limit. macOS ships GNU make
+# 3.81, which has no $(file ...): there printf writes it, as macOS' argument limit is 1 MB)
 $(EXE): $(RT_OBJ) $(GEN_OBJ)
+ifneq ($(filter 3.%,$(MAKE_VERSION)),)
+	@printf '%s\n' $(RT_OBJ) $(GEN_OBJ) > $(B)/link.rsp
+else
 	$(file >$(B)/link.rsp,$(RT_OBJ) $(GEN_OBJ))
+endif
 	$(CC) -o $@ @$(B)/link.rsp $(LDLIBS) $(EXPORT_DYN)
 
 mkromfs: $(B)/mkromfs
