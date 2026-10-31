@@ -49,11 +49,18 @@ static void rtld_fini(Cpu *c) { (void)c; LOG("nnMain returned (game exit)\n"); }
 
 // Claim the guest address range before anything else can map there.
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
-    if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+    bool low = plat_reserve_guest(GUEST_LO, GUEST_LOW_END);
+    bool high = GUEST_HIGH_LO >= GUEST_HI || (low && plat_reserve_guest(GUEST_HIGH_LO, GUEST_HI));
+    if (low && high) return;
+    if (low) plat_unreserve_guest(GUEST_LO, GUEST_LOW_END);
     const char *tries = getenv("ARK_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
-        fprintf(stderr, "FATAL: guest address range %llx-%llx is not free\n", GUEST_LO, GUEST_HI);
+        if (GUEST_HIGH_LO < GUEST_HI)
+            fprintf(stderr, "FATAL: guest address ranges %llx-%llx and %llx-%llx are not free\n", GUEST_LO, GUEST_LOW_END,
+                    GUEST_HIGH_LO, GUEST_HI);
+        else
+            fprintf(stderr, "FATAL: guest address range %llx-%llx is not free\n", GUEST_LO, GUEST_HI);
         exit(1);
     }
     char buf[16];

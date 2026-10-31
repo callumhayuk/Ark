@@ -14,9 +14,6 @@
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
 // guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
 #define GUEST_LO     0x7000000000ull
-// Ark: 64 GB (LAS used 12.5 GB) to hold the 48 GB alias region below. Still below 0x80_0000_0000 (39-bit guest
-// addresses). Pages are backed only when touched.
-#define GUEST_HI     0x8000000000ull
 // Ark: module bases (tools/layout.py must agree)
 #define MAIN_BASE    0x7000000000ull
 #define MULTIMEDIA_BASE 0x7008000000ull
@@ -30,11 +27,32 @@
 #define HLE_HEAP_SIZE 0x000E000000ull
 // Ark: the alias region is also what the SDK's virtual-address memory manager (nn::os VammManager) reserves its
 // address space from (GetReservedRegionImpl reads svcGetInfo 2/3). Legends: Arceus asks it for 32 GB, so the
-// region is 48 GB at the top of the window (on hardware, 64 GB). LAS: 4 GB at 0x71_0000_0000.
-#define ALIAS_BASE   0x7400000000ull   // alias region (svcMapMemory targets, VAMM reserve)
+// region is 48 GB (on hardware, 64 GB). LAS: 4 GB at 0x71_0000_0000.
 #define ALIAS_SIZE   0x0C00000000ull
-#define HEAP_BASE    0x7240000000ull
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+#define STACK_SIZE   0x0040000000ull
+#if defined(__APPLE__)
+// PLA recomp, macOS 26+: malloc's heap range (about 24.5 GB of reservations, placed at random between
+// 0x72_0000_0000 and 0x7D_0000_0000 on every launch, ASLR or not) sits inside 0x70-0x80, and 0xF_C000_0000-
+// 0x70_0000_0000 is reserved. The guest is split in two windows: the modules, HLE, TLS and host heap stay low
+// (code addresses are baked into the generated C), and the stacks, heap and alias region go above
+// 0x80_0000_0000, where nothing is mapped. The guest address space (svcGetInfo 12/13) spans both.
+#define GUEST_LOW_END  0x7100000000ull   // low window [GUEST_LO, GUEST_LOW_END): 4 GB
+#define GUEST_HIGH_LO  0x8000000000ull   // high window [GUEST_HIGH_LO, GUEST_HI): 56 GB
+#define GUEST_HI       0x8E00000000ull
+#define STACK_BASE     0x8000000000ull
+#define HEAP_BASE      0x8040000000ull
+#define ALIAS_BASE     0x8200000000ull   // alias region (svcMapMemory targets, VAMM reserve), to GUEST_HI
+#else
+// Ark: one 64 GB window (LAS used 12.5 GB) to hold the 48 GB alias region at its top. Still below
+// 0x80_0000_0000 (39-bit guest addresses). Pages are backed only when touched.
+#define GUEST_HI       0x8000000000ull
+#define GUEST_LOW_END  GUEST_HI          // (one window: no high part)
+#define GUEST_HIGH_LO  GUEST_HI
+#define STACK_BASE     0x7200000000ull
+#define HEAP_BASE      0x7240000000ull
+#define ALIAS_BASE     0x7400000000ull   // alias region (svcMapMemory targets, VAMM reserve)
+#endif
 
 // ---- loader.c
 typedef struct Module {

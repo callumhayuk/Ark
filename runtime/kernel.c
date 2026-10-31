@@ -212,8 +212,11 @@ static void query_memory(uint64_t addr, uint64_t out) {
         }
         prev_end = r->addr + r->size;
     }
+    // the free rest of the address space: 39 bits, or GUEST_HI where the guest extends above that (macOS, rt.h)
+    uint64_t top = GUEST_HI > (1ull << 39) ? GUEST_HI : (1ull << 39);
+    if (prev_end < addr && addr >= top) prev_end = top;  // (beyond the address space: one free tail to the end)
     info[0] = prev_end;
-    info[1] = (1ull << 39) - prev_end;
+    info[1] = (prev_end < top ? top : 0) - prev_end;
     memcpy((void *)out, info, 0x28);
 }
 
@@ -952,7 +955,7 @@ static void dump_waits(int sig) {
         // the guest's frame-pointer chain (return addresses; symbolize offline against the NSOs)
         fprintf(stderr, "[kernel]   stack:");
         uint64_t fp = t->cpu.x[29];
-        for (int i = 0; i < 16 && fp && !(fp & 7) && fp >= 0x7000000000ull && fp < 0x8000000000ull; i++) {
+        for (int i = 0; i < 16 && fp && !(fp & 7) && fp >= GUEST_LO && fp < GUEST_HI; i++) {
             fprintf(stderr, " %llx", (unsigned long long)((uint64_t *)(uintptr_t)fp)[1]);
             fp = ((uint64_t *)(uintptr_t)fp)[0];
         }

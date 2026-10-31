@@ -355,7 +355,7 @@ static void trace_draw(Cpu *c, uint64_t count) {
     uint64_t chain[14];
     int nc = 0;
     uint64_t fp = c->x[29];
-    for (; nc < 14 && fp >= 0x7000000000ull && fp < 0x8000000000ull && (fp & 7) == 0; nc++) {
+    for (; nc < 14 && fp >= GUEST_LO && fp < GUEST_HI && (fp & 7) == 0; nc++) {
         uint64_t next = *(uint64_t *)(uintptr_t)fp;
         chain[nc] = *(uint64_t *)(uintptr_t)(fp + 8);
         if (next <= fp) { nc++; break; }

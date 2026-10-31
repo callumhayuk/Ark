@@ -33,7 +33,7 @@ static char g_log_path[1024];
 
 // ---- guest address space
 // Everything readable/writable from the start: macOS pages are 16K but the guest maps at 4K granularity.
-// Untouched pages cost nothing, so the 64 GB window (rt.h GUEST_HI) is only address space.
+// Untouched pages cost nothing, so the guest windows (rt.h) are only address space.
 // What already sits at addr (for the log when the window can't be claimed).
 static void report_occupant(uint64_t addr) {
     vm_address_t r = (vm_address_t)addr;
@@ -52,13 +52,8 @@ static void report_occupant(uint64_t addr) {
             (unsigned long long)(size >> 20), info.protection, info.max_protection, info.user_tag, info.share_mode);
 }
 
-// macOS 26+ malloc reserves a large address range at start-up (a 12 GB PROT_NONE region, plus its small-size
-// regions), at a random place that often falls inside the guest window, before any of our code runs. runtime/main.c
-// re-executes up to 20 times when the window can't be claimed; each round of five tries a different launch:
-//   0: as is   1: MallocNanoZone=0   2: ASLR off (fixed layout)   3: both
-// Every failed attempt logs what was in the way; the attempt that succeeds says how.
-static const char *const k_launch[] = {"default", "MallocNanoZone=0", "ASLR off", "MallocNanoZone=0 + ASLR off"};
-
+// When a window can't be claimed, every attempt logs what was in the way, and the first and the last of runtime/
+// main.c's re-executions log the whole address map (rt.h has the macOS layout and why).
 static int reexec_count(void) {
     const char *t = getenv("ARK_REEXEC");
     return t ? atoi(t) : 0;
@@ -133,24 +128,21 @@ static void dump_address_map(void) {
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     int n = reexec_count();
-    const char *how = k_launch[(n / 5) % 4];
     kern_return_t why = KERN_SUCCESS;
     uint64_t taken = claim(lo, hi, &why);
     if (!taken) {
-        if (n) fprintf(stderr, "[plat] guest window %llx-%llx claimed on attempt %d (launch: %s)\n", (unsigned long long)lo,
-                       (unsigned long long)hi, n + 1, how);
+        if (n) fprintf(stderr, "[plat] guest window %llx-%llx claimed on attempt %d\n", (unsigned long long)lo,
+                       (unsigned long long)hi, n + 1);
         return true;
     }
-    fprintf(stderr, "[plat] attempt %d (launch: %s): %llx is taken (%s)\n", n + 1, how, (unsigned long long)taken,
-            mach_error_string(why));
+    fprintf(stderr, "[plat] attempt %d: guest window %llx-%llx: %llx is taken (%s)\n", n + 1, (unsigned long long)lo,
+            (unsigned long long)hi, (unsigned long long)taken, mach_error_string(why));
     report_occupant(taken);
     if (n == 0 || n >= 19) dump_address_map();
-    // Set up the next attempt's launch (runtime/main.c then re-executes through plat_exec).
-    int next = (n + 1) / 5 % 4;
-    if (next & 1) setenv("MallocNanoZone", "0", 1); else unsetenv("MallocNanoZone");
-    if (next & 2) setenv("ARK_NO_ASLR", "1", 1); else unsetenv("ARK_NO_ASLR");
     return false;
 }
+
+void plat_unreserve_guest(uint64_t lo, uint64_t hi) { vm_deallocate(mach_task_self(), (vm_address_t)lo, hi - lo); }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
@@ -290,24 +282,10 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 extern char ***_NSGetArgv(void);
-#include <spawn.h>
-#ifndef _POSIX_SPAWN_DISABLE_ASLR
-#define _POSIX_SPAWN_DISABLE_ASLR 0x0100  // (Apple-private spawn flag, as debuggers use it)
-#endif
-extern char **environ;
 void plat_exec(char *const argv[]) {
     if (argv) { execv(argv[0], argv); return; }
     char path[4096];
-    if (!plat_exe_path(path, sizeof path)) return;
-    if (getenv("ARK_NO_ASLR")) {  // replace this process (SETEXEC), with a fixed address-space layout
-        posix_spawnattr_t at;
-        posix_spawnattr_init(&at);
-        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR);
-        posix_spawn(NULL, path, NULL, &at, *_NSGetArgv(), environ);
-        posix_spawnattr_destroy(&at);  // (only reached when the spawn failed)
-        fprintf(stderr, "[plat] re-exec with ASLR off failed; plain re-exec\n");
-    }
-    execv(path, *_NSGetArgv());
+    if (plat_exe_path(path, sizeof path)) execv(path, *_NSGetArgv());
 }
 
 // End the process at once, skipping library teardown (the GPU driver's threads may still be busy).
