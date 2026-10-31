@@ -84,6 +84,53 @@ static uint64_t claim(uint64_t lo, uint64_t hi, kern_return_t *why) {
     return 0;
 }
 
+
+// The whole address map up to 1 TB, coalesced by owner tag, with the free gaps of 1 GB or more: for choosing where
+// the guest window can live on this macOS (logged on the first and the last attempt).
+#include <mach-o/dyld.h>
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+static void dump_address_map(void) {
+    size_t sc_len = 0;
+    const void *sc = _dyld_get_shared_cache_range(&sc_len);
+    fprintf(stderr, "[map] main image slide %llx; shared cache %llx-%llx\n", (unsigned long long)_dyld_get_image_vmaddr_slide(0),
+            (unsigned long long)(uintptr_t)sc, (unsigned long long)((uintptr_t)sc + sc_len));
+    uint64_t addr = 0, prev_end = 0, run_lo = 0, run_hi = 0;
+    unsigned run_tag = ~0u;
+    int run_prot = -1, lines = 0;
+    for (;;) {
+        vm_address_t r = (vm_address_t)addr;
+        vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &r, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS)
+            break;
+        if (r >= 0x10000000000ull) break;
+        bool joins = r == run_hi && info.user_tag == run_tag && info.protection == run_prot;
+        if (!joins) {
+            if (run_hi > run_lo && lines < 400) {
+                fprintf(stderr, "[map]   %011llx-%011llx %8llu MB tag %3u prot %d\n", (unsigned long long)run_lo,
+                        (unsigned long long)run_hi, (unsigned long long)((run_hi - run_lo) >> 20), run_tag, run_prot);
+                lines++;
+            }
+            if (r - prev_end >= (1ull << 30))
+                fprintf(stderr, "[map]   %011llx-%011llx %8llu MB FREE\n", (unsigned long long)prev_end,
+                        (unsigned long long)r, (unsigned long long)((r - prev_end) >> 20));
+            run_lo = r;
+            run_tag = info.user_tag;
+            run_prot = info.protection;
+        }
+        run_hi = r + size;
+        prev_end = r + size;
+        addr = r + size;
+    }
+    if (run_hi > run_lo)
+        fprintf(stderr, "[map]   %011llx-%011llx %8llu MB tag %3u prot %d\n", (unsigned long long)run_lo,
+                (unsigned long long)run_hi, (unsigned long long)((run_hi - run_lo) >> 20), run_tag, run_prot);
+    if (prev_end < 0x10000000000ull)
+        fprintf(stderr, "[map]   %011llx-%011llx FREE (to 1 TB)\n", (unsigned long long)prev_end, 0x10000000000ull);
+}
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     int n = reexec_count();
     const char *how = k_launch[(n / 5) % 4];
@@ -97,6 +144,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     fprintf(stderr, "[plat] attempt %d (launch: %s): %llx is taken (%s)\n", n + 1, how, (unsigned long long)taken,
             mach_error_string(why));
     report_occupant(taken);
+    if (n == 0 || n >= 19) dump_address_map();
     // Set up the next attempt's launch (runtime/main.c then re-executes through plat_exec).
     int next = (n + 1) / 5 % 4;
     if (next & 1) setenv("MallocNanoZone", "0", 1); else unsetenv("MallocNanoZone");
