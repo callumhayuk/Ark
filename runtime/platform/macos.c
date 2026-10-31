@@ -52,34 +52,56 @@ static void report_occupant(uint64_t addr) {
             (unsigned long long)(size >> 20), info.protection, info.max_protection, info.user_tag, info.share_mode);
 }
 
-bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
-    const char *tries = getenv("ARK_REEXEC");  // (runtime/main.c re-executes up to 20 times when this fails)
-    bool say = !tries || atoi(tries) >= 19;
+// macOS 26+ malloc reserves a large address range at start-up (a 12 GB PROT_NONE region, plus its small-size
+// regions), at a random place that often falls inside the guest window, before any of our code runs. runtime/main.c
+// re-executes up to 20 times when the window can't be claimed; each round of five tries a different launch:
+//   0: as is   1: MallocNanoZone=0   2: ASLR off (fixed layout)   3: both
+// Every failed attempt logs what was in the way; the attempt that succeeds says how.
+static const char *const k_launch[] = {"default", "MallocNanoZone=0", "ASLR off", "MallocNanoZone=0 + ASLR off"};
+
+static int reexec_count(void) {
+    const char *t = getenv("ARK_REEXEC");
+    return t ? atoi(t) : 0;
+}
+
+// Claim [lo, hi) in one request, else in 1 GB pieces. Returns 0, or the address of the first piece that was taken.
+static uint64_t claim(uint64_t lo, uint64_t hi, kern_return_t *why) {
     vm_address_t a = lo;
     kern_return_t kr = vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED);
-    if (kr == KERN_SUCCESS && a == lo) return true;
+    if (kr == KERN_SUCCESS && a == lo) return 0;
     if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), a, hi - lo);
-    if (say)
-        fprintf(stderr, "[plat] reserving %llx-%llx in one piece failed: %s; trying 1 GB pieces\n", (unsigned long long)lo,
-                (unsigned long long)hi, mach_error_string(kr));
-    // Claim it piece by piece: works where one request this large is refused, and names what is in the way if a
-    // piece is already taken.
     const uint64_t step = 1ull << 30;
     for (uint64_t p = lo; p < hi; p += step) {
         uint64_t n = hi - p < step ? hi - p : step;
         a = (vm_address_t)p;
         kr = vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED);
         if (kr == KERN_SUCCESS && a == p) continue;
-        if (say) {
-            fprintf(stderr, "[plat] piece %llx-%llx: %s\n", (unsigned long long)p, (unsigned long long)(p + n),
-                    mach_error_string(kr));
-            report_occupant(p);
-        }
+        if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), a, n);
         if (p > lo) vm_deallocate(mach_task_self(), (vm_address_t)lo, p - lo);
-        return false;
+        *why = kr;
+        return p;
     }
-    fprintf(stderr, "[plat] reserved %llx-%llx in 1 GB pieces\n", (unsigned long long)lo, (unsigned long long)hi);
-    return true;
+    return 0;
+}
+
+bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
+    int n = reexec_count();
+    const char *how = k_launch[(n / 5) % 4];
+    kern_return_t why = KERN_SUCCESS;
+    uint64_t taken = claim(lo, hi, &why);
+    if (!taken) {
+        if (n) fprintf(stderr, "[plat] guest window %llx-%llx claimed on attempt %d (launch: %s)\n", (unsigned long long)lo,
+                       (unsigned long long)hi, n + 1, how);
+        return true;
+    }
+    fprintf(stderr, "[plat] attempt %d (launch: %s): %llx is taken (%s)\n", n + 1, how, (unsigned long long)taken,
+            mach_error_string(why));
+    report_occupant(taken);
+    // Set up the next attempt's launch (runtime/main.c then re-executes through plat_exec).
+    int next = (n + 1) / 5 % 4;
+    if (next & 1) setenv("MallocNanoZone", "0", 1); else unsetenv("MallocNanoZone");
+    if (next & 2) setenv("ARK_NO_ASLR", "1", 1); else unsetenv("ARK_NO_ASLR");
+    return false;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
@@ -220,10 +242,24 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 extern char ***_NSGetArgv(void);
+#include <spawn.h>
+#ifndef _POSIX_SPAWN_DISABLE_ASLR
+#define _POSIX_SPAWN_DISABLE_ASLR 0x0100  // (Apple-private spawn flag, as debuggers use it)
+#endif
+extern char **environ;
 void plat_exec(char *const argv[]) {
     if (argv) { execv(argv[0], argv); return; }
     char path[4096];
-    if (plat_exe_path(path, sizeof path)) execv(path, *_NSGetArgv());
+    if (!plat_exe_path(path, sizeof path)) return;
+    if (getenv("ARK_NO_ASLR")) {  // replace this process (SETEXEC), with a fixed address-space layout
+        posix_spawnattr_t at;
+        posix_spawnattr_init(&at);
+        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR);
+        posix_spawn(NULL, path, NULL, &at, *_NSGetArgv(), environ);
+        posix_spawnattr_destroy(&at);  // (only reached when the spawn failed)
+        fprintf(stderr, "[plat] re-exec with ASLR off failed; plain re-exec\n");
+    }
+    execv(path, *_NSGetArgv());
 }
 
 // End the process at once, skipping library teardown (the GPU driver's threads may still be busy).
