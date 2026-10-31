@@ -25,6 +25,9 @@
 #include "../platform.h"
 
 static mach_timebase_info_data_t tb;
+// Debug watchpoints (runtime/dispatch.c): no single-stepping here; the watch thread re-closes pages instead, as on
+// Windows.
+int plat_watch_singlestep = 0;
 static char g_log_path[1024];
 
 // ---- guest address space
