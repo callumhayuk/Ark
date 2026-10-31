@@ -77,7 +77,11 @@ static volatile uint64_t sample_pc;
 static volatile int sample_done;
 static void sample_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
+#if defined(__aarch64__)
+    sample_pc = (uint64_t)((ucontext_t *)uc)->uc_mcontext.pc;  // PLA recomp: arm64 hosts
+#else
     sample_pc = (uint64_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#endif
     __atomic_store_n(&sample_done, 1, __ATOMIC_RELEASE);
 }
 

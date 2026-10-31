@@ -38,6 +38,13 @@ EXE      := $(B)/ark.exe
 OSFLAGS  := -D_WIN32_WINNT=0x0A00 -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S \
             -DWIN32_LEAN_AND_MEAN -DNOMINMAX
 PY       ?= $(if $(wildcard tools/venv/Scripts/python.exe),tools/venv/Scripts/python.exe,python)
+else ifeq ($(shell uname -s),Darwin)
+# macOS on Apple silicon (PLA recomp Phase 1): Xcode command-line tools' clang; Homebrew for SDL3/shaderc/opus.
+PLATFORM := runtime/platform/macos.c
+EXE      := $(B)/ark
+OSFLAGS  :=
+PY       ?= python3
+DEPS     ?= $(shell brew --prefix 2>/dev/null)
 else
 PLATFORM := runtime/platform/linux.c
 EXE      := $(B)/ark
@@ -51,8 +58,8 @@ HEADLESS ?= 0
 ifeq ($(HEADLESS),1)
 # no renderer, no SDL: the NVN layer, input and the menu hooks stay out
 RT_SRC   := $(filter-out runtime/ui_none.c runtime/hle/input.c runtime/hle/bindings.c runtime/hotkeys.c,$(RT_SRC))
-RTDEFS   := -DARK_HEADLESS -Iruntime/headless
-LDLIBS   := -lpthread -lm -ldl
+RTDEFS   := -DARK_HEADLESS -Iruntime/headless $(if $(DEPS),-I$(DEPS)/include)
+LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib) -lopus -lpthread -lm -ldl
 else
 RT_SRC   += $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) $(wildcard runtime/nvn/vulkan/*.c)
 RT_CXX   := $(wildcard runtime/nvn/vulkan/*.cpp)
@@ -106,7 +113,7 @@ ark: $(EXE)
 # (the object list goes in a response file: ~1,800 paths are over Windows' command-line limit)
 $(EXE): $(RT_OBJ) $(GEN_OBJ)
 	$(file >$(B)/link.rsp,$(RT_OBJ) $(GEN_OBJ))
-	$(CC) -o $@ @$(B)/link.rsp $(LDLIBS) $(if $(filter Windows_NT,$(OS)),,-rdynamic)
+	$(CC) -o $@ @$(B)/link.rsp $(LDLIBS) $(if $(filter Windows_NT,$(OS)),,$(if $(filter Darwin,$(shell uname -s)),-Wl,-export_dynamic,-rdynamic))
 
 mkromfs: $(B)/mkromfs
 $(B)/mkromfs: tools/mkromfs/mkromfs.c runtime/romfs_build.c
