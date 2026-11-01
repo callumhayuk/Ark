@@ -20,6 +20,7 @@
 #define R_NOT_FOUND 0xF201
 #define R_INVALID_ENUM 0xF001
 #define R_OUT_OF_RESOURCE 0xD001
+#define R_INVALID_MEMORY_REGION 0xD401
 
 #define PSEUDO_THREAD 0xFFFF8000u
 #define PSEUDO_PROCESS 0xFFFF8001u
@@ -127,6 +128,14 @@ static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t per
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
+}
+
+// Is [addr, addr+size) inside the guest windows the host claimed (rt.h)? Mappings elsewhere would write over host
+// memory (macOS: malloc's heap range between the two windows), so they are refused as on hardware.
+static bool guest_range_ok(uint64_t addr, uint64_t size) {
+    uint64_t end = addr + size;
+    if (end < addr) return false;
+    return (addr >= GUEST_LO && end <= GUEST_LOW_END) || (addr >= GUEST_HIGH_LO && end <= GUEST_HI);
 }
 
 static void region_remove(uint64_t addr) {
@@ -668,6 +677,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x02: case 0x03: x[0] = R_OK; break;  // SetMemoryPermission / SetMemoryAttribute
     case 0x04:  // MapMemory(dst, src, size): src is inaccessible while mapped, so copying is equivalent
+        if (!guest_range_ok(x[0], x[2]) || !guest_range_ok(x[1], x[2])) { x[0] = R_INVALID_MEMORY_REGION; break; }
         memcpy((void *)x[0], (void *)x[1], x[2]);
         region_add(x[0], x[2], 0xB, 3);
         x[0] = R_OK;
@@ -751,6 +761,12 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         KObject *o = handle_get((uint32_t)x[0]);
         if (!o || o->type != KOBJ_SHMEM) { x[0] = R_INVALID_HANDLE; break; }
         KSharedMem *s = (KSharedMem *)o;
+        if (!guest_range_ok(x[1], x[2])) {
+            LOG("[kernel] MapSharedMemory at %llx +%llx: outside the guest windows, refused\n", (unsigned long long)x[1],
+                (unsigned long long)x[2]);
+            x[0] = R_INVALID_MEMORY_REGION;
+            break;
+        }
         memset((void *)x[1], 0, x[2]);
         s->guest_addr = x[1];  // HLE services write straight into the guest's mapping
         region_add(x[1], x[2], 6, 3);
@@ -855,6 +871,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         if (getenv("ARK_LOG_PHYS")) LOG("[phys] map %llx +%llx\n", (unsigned long long)x[0], (unsigned long long)x[1]);
         // Ark: pages already mapped keep their contents (the SDK's heap keeps its header at the start of the range it
         // extends; LAS zeroed the whole range). Never-touched pages are zero already, unmapped ones were discarded.
+        if (!guest_range_ok(x[0], x[1])) { x[0] = R_INVALID_MEMORY_REGION; break; }
         pthread_mutex_lock(&phys_lock);
         region_map_physical(x[0], x[1]);
         phys_gen++;
@@ -978,6 +995,10 @@ void kernel_init(void) {
 #endif
     // Reserve the heap, alias, stack, and TLS regions.
     region_add(TLS_BASE, TLS_SIZE, 0xC, 3);
+    // macOS (rt.h): the gap between the two guest windows belongs to the host (malloc's heap range). Report it as
+    // Inaccessible (0x10), or the SDK picks addresses there for shared memory and the like (it chooses at random
+    // among what QueryMemory calls free in the ASLR region, svcGetInfo 12/13).
+    if (GUEST_HIGH_LO > GUEST_LOW_END) region_add(GUEST_LOW_END, GUEST_HIGH_LO - GUEST_LOW_END, 0x10, 0);
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
         region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
