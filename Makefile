@@ -67,10 +67,16 @@ RTDEFS   := $(if $(DEPS),-I$(DEPS)/include) -Iruntime/nvn -I$(B)/inc -Ithird_par
 ifeq ($(OS),Windows_NT)
 LDLIBS   := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lvulkan-1 -lshaderc_shared -lopus \
             -lstdc++ -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lpthread
+else ifeq ($(shell uname -s),Darwin)
+# macOS: Vulkan through MoltenVK (Homebrew vulkan-loader + molten-vk); Apple's C++ library is libc++
+LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib -Wl,-rpath,$(DEPS)/lib) -lSDL3 -lvulkan -lshaderc_shared -lopus -lc++ -lpthread -lm
 else
 LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib -Wl,-rpath,$(DEPS)/lib) -lSDL3 -lvulkan -lshaderc_shared -lopus -lstdc++ -lpthread -lm -ldl
 endif
 endif
+# extra compiler flags for the runtime, e.g. ARK_CFLAGS=-I<folder with vma/vk_mem_alloc.h> (header-only, not in Homebrew)
+ARK_CFLAGS ?=
+RTDEFS   += $(ARK_CFLAGS)
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)) $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(RT_CXX))
 RTFLAGS  := -O1 -g -std=gnu11 $(MFLAGS) $(OSFLAGS) -fno-strict-aliasing -Iruntime/include -Iruntime $(RTDEFS) \
             -Wall -Wno-unused-function -Wno-format

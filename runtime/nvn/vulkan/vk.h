@@ -9,6 +9,9 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#if defined(__APPLE__)
+#define VK_ENABLE_BETA_EXTENSIONS  // VK_KHR_portability_subset (MoltenVK) is a provisional extension
+#endif
 #include <vulkan/vulkan.h>
 #if __has_include(<vma/vk_mem_alloc.h>)
 #include <vma/vk_mem_alloc.h>

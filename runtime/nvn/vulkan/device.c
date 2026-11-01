@@ -35,7 +35,11 @@ static void create_instance(void) {
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
     const char *ext[16];
     uint32_t n_ext = 0;
-    for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    for (Uint32 i = 0; i < n_sdl && n_ext < 13; i++) ext[n_ext++] = sdl_ext[i];
+#if defined(__APPLE__)
+    // MoltenVK is a "portability" driver: the loader only lists it for an instance that opts in
+    ext[n_ext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+#endif
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -44,6 +48,9 @@ static void create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
+#if defined(__APPLE__)
+    ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
@@ -151,6 +158,12 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+#if defined(VK_KHR_portability_subset)
+    // MoltenVK (macOS): the spec requires enabling VK_KHR_portability_subset where the device has it; its features
+    // say what Metal can't do (all the device has are enabled; the missing ones are logged)
+    bool portability = has_ext(ep, ne, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    if (portability) ext[n_ext++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+#endif
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -198,9 +211,26 @@ static void create_device(void) {
         ARK_FEAT(f13.maintenance4, h13.maintenance4, "maintenance4")
 #undef ARK_FEAT
     }
+    void *chain = &f11;
+#if defined(VK_KHR_portability_subset)
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR ps = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+    if (portability) {
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &ps};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);  // (fills ps with what the device supports; enable all of it)
+#define ARK_PS(name) if (!ps.name) LOG("[vk] portability: no " #name "\n");
+        ARK_PS(constantAlphaColorBlendFactors) ARK_PS(events) ARK_PS(imageViewFormatReinterpretation)
+        ARK_PS(imageViewFormatSwizzle) ARK_PS(imageView2DOn3DImage) ARK_PS(multisampleArrayImage)
+        ARK_PS(mutableComparisonSamplers) ARK_PS(pointPolygons) ARK_PS(samplerMipLodBias)
+        ARK_PS(separateStencilMaskRef) ARK_PS(shaderSampleRateInterpolationFunctions) ARK_PS(tessellationIsolines)
+        ARK_PS(tessellationPointMode) ARK_PS(triangleFans) ARK_PS(vertexAttributeAccessBeyondStride)
+#undef ARK_PS
+        ps.pNext = chain;
+        chain = &ps;
+    }
+#endif
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
-                                           .pNext = &f11};
-    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+                                           .pNext = chain};
+    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : chain};
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
