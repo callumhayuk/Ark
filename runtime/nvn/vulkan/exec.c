@@ -905,9 +905,15 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
-    if (!rect.extent.width || !rect.extent.height) return;
-    if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
+    if (!rect.extent.width || !rect.extent.height || (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED))) {
+        if (g_debug_frame) LOG("[clear] rt %d depth %d stencil %d: skipped (empty scissor or no such target)\n", index, depth, stencil);
+        return;
+    }
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
+    if (g_debug_frame)
+        LOG("[clear] rt %d mask %#x depth %d (%g, has %d) stencil %d (%#x, write mask %#x, has %d) rect %d,%d %ux%u via %s\n",
+            index, mask, depth, dval, pass_depth != VK_FORMAT_UNDEFINED, stencil, sval, smask, pass_stencil != VK_FORMAT_UNDEFINED,
+            rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, simple ? "vkCmdClearAttachments" : "clear pipeline");
     if (simple) {
         VkClearAttachment a[2];
         uint32_t n = 0;
@@ -2628,6 +2634,13 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (st.ds[3]) {  // stencil test: ops (fail, zfail, zpass) and func per face, ref, write and compare masks
+        uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
+        LOG("[draw]   stencil%s front ops %x/%x/%x func %x ref %#x wmask %#x cmask %#x | back ops %x/%x/%x func %x ref %#x wmask %#x"
+            " cmask %#x\n", pass_stencil ? "" : " (no stencil attachment)", ops & 0xF, (ops >> 8) & 0xF, (ops >> 4) & 0xF,
+            st.ds[4] & 0xF, st.stencil_ref[0], st.stencil_mask[0], st.stencil_vmask[0], (ops >> 12) & 0xF, (ops >> 20) & 0xF,
+            (ops >> 16) & 0xF, st.ds[4] >> 4, st.stencil_ref[1], st.stencil_mask[1], st.stencil_vmask[1]);
+    }
     if (getenv("LARECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
