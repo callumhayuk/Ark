@@ -1842,6 +1842,15 @@ static const char glsl_prelude[] =
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#extension GL_EXT_nonuniform_qualifier : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
+    // The helpers below carry MSL's names (the translator's first target was MSL). Those names are free in GLSL, but
+    // once SPIRV-Cross turns the SPIR-V into MSL (MoltenVK on macOS) they collide with Metal's own fmin, fmax, clz,
+    // popcount and mulhi ("call to 'fmin' is ambiguous"), so they are renamed for the GLSL compiler here.
+    "#define fmin ark_fmin\n"
+    "#define fmax ark_fmax\n"
+    "#define clz ark_clz\n"
+    "#define popcount ark_popcount\n"
+    "#define mulhi ark_mulhi\n"
+    "#define saturate ark_saturate\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
     "uint as_u(uint x) { return x; }\n"
     "uint as_u(int x) { return uint(x); }\n"
