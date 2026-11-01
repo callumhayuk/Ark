@@ -234,6 +234,7 @@ static void create_device(void) {
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
+    g_vk.dual_src = h->dualSrcBlend;  // (exec.c: dual-source blending through c1)
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
     g_vk.aniso = h->samplerAnisotropy;
@@ -289,10 +290,12 @@ static void create_device(void) {
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
 
-    // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save)
+    // pipeline cache: VK_PIPELINE_CACHE_FILE (vk.h; written by vk_pipeline_cache_save). The unversioned file of
+    // earlier builds holds entries for shaders that no longer exist: dropped.
+    remove("cache/vk_pipelines.bin");
     size_t sz = 0;
     void *data = NULL;
-    FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
+    FILE *fp = fopen(VK_PIPELINE_CACHE_FILE, "rb");
     if (fp) {
         fseek(fp, 0, SEEK_END);
         sz = (size_t)ftell(fp);
@@ -316,11 +319,11 @@ void vk_pipeline_cache_save(void) {
     void *data = malloc(sz);
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         mkdir("cache", 0755);
-        FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
+        FILE *f = fopen(VK_PIPELINE_CACHE_FILE ".tmp", "wb");
         if (f) {
             bool ok = fwrite(data, 1, sz, f) == sz;
             fclose(f);
-            if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
+            if (ok) { remove(VK_PIPELINE_CACHE_FILE); rename(VK_PIPELINE_CACHE_FILE ".tmp", VK_PIPELINE_CACHE_FILE); }
         }
     }
     free(data);
@@ -698,7 +701,14 @@ static int exit_guard(void *a) {  // a GPU wait that never returns must not keep
 
 void ui_set_title(const char *title) { if (window) SDL_SetWindowTitle(window, title); }
 
-static void quick_exit_handler(void) {
+// Orderly end of the process: wait for the GPU, keep the pipeline cache, then end at once without library teardown.
+// Called for the window's close button and ARK_RUN_SECONDS (and as the atexit handler). Ending with exit() instead
+// ran the libraries' static destructors while the pipeline workers were still inside vkCreateGraphicsPipelines: on
+// macOS MoltenVK's SPIRV-Cross then used a destroyed table (crash at exit, "Ark quit unexpectedly"). MoltenVK is
+// loaded after this handler is registered, so its destructors would even run first.
+void vk_exit_now(void);
+static void quick_exit_handler(void) { vk_exit_now(); }
+void vk_exit_now(void) {
     SDL_DetachThread(SDL_CreateThread(exit_guard, "exit_guard", NULL));
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
@@ -711,9 +721,7 @@ static void quick_exit_handler(void) {
     if (trace) LOG("[vk] exit: terminating\n");
     fflush(stdout);
     fflush(stderr);
-#if defined(_WIN32) || defined(__linux__)
     plat_terminate();
-#endif
 }
 
 void ui_window_init(void) {
@@ -774,7 +782,7 @@ int ui_run(void) {
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
-                exit(0);
+                vk_exit_now();  // (not exit(): see vk_exit_now)
             }
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);

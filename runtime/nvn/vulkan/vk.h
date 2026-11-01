@@ -20,6 +20,11 @@
 #endif
 
 #include "../nvn.h"
+
+// The pipeline cache keeps drivers' compiled shaders (MoltenVK: the generated MSL, recompiled when the cache is
+// loaded). Bump the version when the translated shaders change in a way that leaves old entries useless.
+// v2: MSL-named helpers renamed, dual-source blending through c1 (MoltenVK).
+#define VK_PIPELINE_CACHE_FILE "cache/vk_pipelines.v2.bin"
 #include "../maxwell/shader.h"
 
 void vk_device_fault_report(void);
@@ -37,7 +42,7 @@ typedef struct {
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import, aniso;
+    bool custom_border, divisor, host_import, aniso, dual_src;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

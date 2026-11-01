@@ -75,7 +75,9 @@ __attribute__((constructor(101))) static void reserve_guest_space(void) {
 static void *run_limit_thread(void *arg) {
     sleep((unsigned)*(int *)arg);
     LOG("ARK_RUN_SECONDS reached, exiting\n");
-    exit(0);  // (the backend's atexit handler waits for the GPU and keeps the pipeline cache)
+    extern void vk_exit_now(void);
+    vk_exit_now();  // waits for the GPU, keeps the pipeline cache, ends without library teardown
+    return NULL;
 }
 #endif
 

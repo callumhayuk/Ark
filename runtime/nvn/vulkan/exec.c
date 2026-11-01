@@ -953,6 +953,8 @@ typedef struct {
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
     ShaderKey vkey, fkey;
     VkShaderModule vs, fs;
+    VkShaderModule fs_dual;  // (lazy) fs with c1 as the second blend source of target 0 (dual-source blending)
+    _Atomic int fs_dual_state;  // 0 not tried, 1 fs_dual ready, 2 impossible (no c1, or it failed to compile)
     VkBindingInfo binds[MAX_BIND];
     int nbinds;
     VkDescriptorSetLayout set_layout[2];
@@ -1024,6 +1026,37 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+}
+
+// The program's fragment shader with c1 as the dual-source blend input (made once; NULL when there is no c1 or it
+// does not compile). Called from the pipeline workers.
+static VkShaderModule prog_fs_dual(Prog *p) {
+    int st = atomic_load(&p->fs_dual_state);
+    if (st) return st == 1 ? p->fs_dual : VK_NULL_HANDLE;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!atomic_load(&p->fs_dual_state)) {
+        static const char from[] = "layout(location = 1) out vec4 c1;";
+        const char *src = p->fi ? p->fi->msl : NULL, *at = src ? strstr(src, from) : NULL;
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (at) {
+            static const char to[] = "layout(location = 0, index = 1) out vec4 c1;";
+            size_t n = strlen(src), pre = (size_t)(at - src);
+            char *dual = malloc(n + sizeof to);
+            memcpy(dual, src, pre);
+            memcpy(dual + pre, to, sizeof to - 1);
+            strcpy(dual + pre + sizeof to - 1, at + sizeof from - 1);
+            size_t nw = 0;
+            uint32_t *spv = vk_glsl_to_spirv(dual, STAGE_FRAGMENT, "fs_dual", &nw);
+            if (spv) m = vk_module(spv, nw);
+            free(spv);
+            free(dual);
+        }
+        p->fs_dual = m;
+        atomic_store(&p->fs_dual_state, m ? 1 : 2);
+    }
+    pthread_mutex_unlock(&lock);
+    return atomic_load(&p->fs_dual_state) == 1 ? p->fs_dual : VK_NULL_HANDLE;
 }
 
 static void translate_program(void *arg) {
@@ -1265,6 +1298,20 @@ static VkBlendFactor blend_factor(uint8_t f) {
     }
 }
 
+// Dual-source blending: factors 0x10..0x13 (SRC1_*) read a second colour from the fragment shader. On Maxwell that is
+// output 1 (c1); Vulkan and Metal take it from location 0, index 1. A program that writes c1 gets a variant with c1
+// declared that way (prog_fs_dual). Without one (no c1, or several targets), SRC1 is taken as zero: the factors are
+// rewritten to what a zero second colour gives. (Desktop drivers blend an undefined value there; Metal refuses
+// the pipeline: "Fragment shader does not write to render target color(0), index(1) that is required for blending".)
+static bool is_src1(uint8_t f) { return f >= 0x10 && f <= 0x13; }
+static uint8_t src1_as_zero(uint8_t f) {
+    switch (f) {
+    case 0x10: case 0x12: return 1;  // SRC1_COLOR / SRC1_ALPHA -> ZERO
+    case 0x11: case 0x13: return 2;  // ONE_MINUS_SRC1_* -> ONE
+    default: return f;
+    }
+}
+
 static VkBlendOp blend_op(uint8_t e) {
     switch (e) {
     case 2: return VK_BLEND_OP_SUBTRACT;
@@ -1421,7 +1468,14 @@ static void build_pipeline(void *arg) {
     for (uint32_t i = 0; i < k->ncolor; i++) {
         cba[i].colorWriteMask = k->write_mask[i];
         if ((k->blend_on >> i) & 1) {
-            const uint8_t *b = k->blend[i];
+            uint8_t b[8];
+            memcpy(b, k->blend[i], sizeof b);
+            if (is_src1(b[1]) || is_src1(b[2]) || is_src1(b[3]) || is_src1(b[4])) {
+                // dual-source: c1 is the second source where there is one target and the program writes c1
+                VkShaderModule dual = i == 0 && k->ncolor == 1 && g_vk.dual_src ? prog_fs_dual(k->prog) : VK_NULL_HANDLE;
+                if (dual) stages[1].module = dual;
+                else for (int j = 1; j <= 4; j++) b[j] = src1_as_zero(b[j]);
+            }
             cba[i].blendEnable = VK_TRUE;
             cba[i].srcColorBlendFactor = blend_factor(b[1]);
             cba[i].dstColorBlendFactor = blend_factor(b[2]);
