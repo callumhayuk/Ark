@@ -1447,8 +1447,16 @@ static void build_pipeline(void *arg) {
     build_end(bi);
     if (r != VK_SUCCESS) {
         static int n;
-        if (n++ < 10) LOG("[vk] pipeline creation failed: %d (vs %llx fs %llx)\n", r, (unsigned long long)k->prog->code[0],
-                          (unsigned long long)k->prog->code[1]);
+        if (n++ < 10) {
+            LOG("[vk] pipeline creation failed: %d (vs %llx fs %llx)\n", r, (unsigned long long)k->prog->code[0],
+                (unsigned long long)k->prog->code[1]);
+            // the program's GLSL, for reproducing the failure offline (e.g. MoltenVK's SPIR-V -> MSL conversion)
+            mkdir("build/glsl-failed", 0755);
+            char prefix[96];
+            snprintf(prefix, sizeof prefix, "build/glsl-failed/%llx_%llx", (unsigned long long)k->prog->code[0],
+                     (unsigned long long)k->prog->code[1]);
+            vk_save_prog_glsl(k->prog, prefix);
+        }
     }
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
