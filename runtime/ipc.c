@@ -79,8 +79,16 @@ SERVICE("sm:", sm_handler) {
 }
 
 // ------------------------------------------------------------------ message codec
+// IPC buffer descriptors (A/B/W and X) carry 39 address bits, so the SDK drops bit 39 when it packs one. Where the
+// guest extends above 2^39 (macOS: the stacks, heap and alias region at 0x80_0000_0000-GUEST_HI, rt.h), a packed
+// address below GUEST_HI - 2^39 can only be one of those (no guest memory lies there), so bit 39 goes back on.
+static uint64_t addr39(uint64_t a) {
+    if (GUEST_HI > (1ull << 39) && a && a < GUEST_HI - (1ull << 39)) a |= 1ull << 39;
+    return a;
+}
+
 static uint64_t buf_addr(const uint32_t *w) {
-    return w[1] | ((uint64_t)(w[2] >> 28) << 32) | ((uint64_t)((w[2] >> 2) & 7) << 36);
+    return addr39(w[1] | ((uint64_t)(w[2] >> 28) << 32) | ((uint64_t)((w[2] >> 2) & 7) << 36));
 }
 
 int ipc_handle_request(Cpu *c, uint32_t handle) {
@@ -107,7 +115,7 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
         for (int i = 0; i < req.nmove; i++) req.move_handles[i] = *p++;
     }
     for (int i = 0; i < nx; i++, p += 2) {
-        req.x[i].addr = p[1] | ((uint64_t)((p[0] >> 12) & 0xF) << 32) | ((uint64_t)((p[0] >> 6) & 0x7) << 36);
+        req.x[i].addr = addr39(p[1] | ((uint64_t)((p[0] >> 12) & 0xF) << 32) | ((uint64_t)((p[0] >> 6) & 0x7) << 36));
         req.x[i].size = p[0] >> 16;
     }
     req.nx = nx;
