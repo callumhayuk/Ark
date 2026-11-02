@@ -2656,6 +2656,22 @@ static void draw_(CmdRec *r, bool indexed) {
 }
 
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
+    // (F9) the GLSL of every program drawn in a debug frame, once each: build/glsl-f9/<vs>_<fs>.{vert,frag}
+    {
+        static uint64_t saved[512];
+        static int nsaved;
+        uint64_t key = st.program->stages[0].code_addr * 31 + st.program->stages[1].code_addr;
+        bool have = false;
+        for (int i = 0; i < nsaved; i++) have |= saved[i] == key;
+        if (!have && nsaved < 512) {
+            saved[nsaved++] = key;
+            mkdir("build/glsl-f9", 0755);
+            char prefix[96];
+            snprintf(prefix, sizeof prefix, "build/glsl-f9/%llx_%llx", (unsigned long long)st.program->stages[0].code_addr,
+                     (unsigned long long)st.program->stages[1].code_addr);
+            vk_save_prog_glsl(pr, prefix);
+        }
+    }
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
