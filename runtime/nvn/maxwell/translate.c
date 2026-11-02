@@ -96,6 +96,7 @@ typedef struct {
     bool branchy;  // program uses the pc state machine
     bool uses_xo;  // transform feedback: the vertex outputs' raw words kept as uints (xo_[], see attr_store)
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
+    int ipa_mul;   // (IPA.MUL) the multiplier register
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
@@ -277,7 +278,15 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 c->in_attr_mask |= 1u << a;
                 // IPA "pass" yields attr/w (the shader multiplies by w itself); Metal gives attr.
                 if (c->ipa_mode == 0) sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w)", a, comp);
-                else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
+                else if (c->ipa_mode == 1 && c->ipa_mul != RZ) {
+                    // IPA.MUL yields (attr/w) * Rb. Compilers almost always pass Rb = w (1 / the interpolated
+                    // pos.w), which is attr: that case stays exact. Any other multiplier (e.g. a projective
+                    // texture coordinate's own 1/q: xy/q in screen space) is applied, or the coordinate stays
+                    // undivided (the opening's light shafts sampled depth at 3x their screen position).
+                    c->reg_used[c->ipa_mul] = 1;
+                    sprintf(e, "as_type<uint>(abs(as_type<float>(r%d) * in.pos.w - 1.0f) < 1e-5f ? in.v%d[%d] : "
+                               "in.v%d[%d] * in.pos.w * as_type<float>(r%d))", c->ipa_mul, a, comp, a, comp, c->ipa_mul);
+                } else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
             }
         } else if (addr == 0x3FC) { c->uses_front_facing = true; strcpy(e, "(front_facing ? 0xFFFFFFFFu : 0u)"); }
         else if (addr == 0x2E0 || addr == 0x2E4) { sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
@@ -902,6 +911,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (mode == 2) c->flat_mask |= 1u << at;
         }
         c->ipa_mode = mode;
+        c->ipa_mul = (int)bits(w, 20, 8);
         attr_load(c, d, addr, NULL);
         c->ipa_mode = -1;
         if (bits(w, 51, 1) && d != RZ) sp(&c->body, "    r%d = as_type<uint>(saturate(as_type<float>(r%d)));\n", d, d);
