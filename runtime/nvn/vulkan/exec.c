@@ -899,6 +899,16 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
     return p;
 }
 
+static void debug_save_depth(TexBackend *b, const char *path);
+// (debug frames) the depth attachment right after a depth clear: is every earlier frame's depth gone?
+static void debug_after_depth_clear(void) {
+    if (!g_debug_frame || !st.rt.depth || !st.rt.depth->backend) return;
+    static int n;
+    char path[96];
+    snprintf(path, sizeof path, "build/fbdepth_clear_%03d.pgm", n++);
+    vk_end_pass();
+    debug_save_depth(st.rt.depth->backend, path);
+}
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
     begin_pass();
@@ -935,6 +945,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         if (dsa) a[n++] = (VkClearAttachment){.aspectMask = dsa, .clearValue.depthStencil = {dval, sval}};
         VkClearRect cr = {rect, 0, 1};
         if (n) vkCmdClearAttachments(cb, n, a, 1, &cr);
+        if (depth && pass_depth) debug_after_depth_clear();
         return;
     }
     VkPipeline p = clear_pipeline(index, kind, mask, depth, stencil);
@@ -959,6 +970,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     pc[4] = dval;
     vkCmdPushConstants(cb, pc_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
+    if (depth && pass_depth) debug_after_depth_clear();
 }
 
 // ================================================================== programs
@@ -2844,6 +2856,16 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     if (small_mem) vmaDestroyImage(g_vk.vma, srcimg, small_mem);
 }
 
+// (debug frames) both ends of a depth copy, to see whether the copy carried the current frame's depth
+static void debug_copy_depth(TexBackend *s, TexBackend *d) {
+    if (!g_debug_frame || !(s->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    static int n;
+    char path[96];
+    snprintf(path, sizeof path, "build/fbdepth_copy_%03d_src.pgm", n);
+    debug_save_depth(s, path);
+    snprintf(path, sizeof path, "build/fbdepth_copy_%03d_dst.pgm", n++);
+    debug_save_depth(d, path);
+}
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
@@ -2905,6 +2927,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         VkImageCopy c = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
                          .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
         vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        debug_copy_depth(s, d);
         return;
     }
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked
@@ -2918,6 +2941,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     dl_note("  blit %p lv%u/%u %ux%u (%d,%d %dx%d) -> %p lv%u/%u %ux%u (%d,%d %dx%d) %s", (void *)s->image, slv, s->levels, s->width,
             s->height, sx0, sy0, sw, sh, (void *)d->image, dlv, d->levels, d->width, d->height, dx0, dy0, dw, dh, linear ? "linear" : "nearest");
     vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    debug_copy_depth(s, d);
 }
 
 // ================================================================== present helpers (device.c)
