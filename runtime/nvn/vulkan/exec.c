@@ -2169,6 +2169,16 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
     PROF_ADD(prof_draw);
+    // (debug frames, ARK_F9_SPLIT_BLEND=1) end the pass after each blended draw into a target with depth, so each one's
+    // result is saved as its own pass image: finds the draw that paints the dark trails in the opening
+    static int split = -1;
+    if (split < 0) split = getenv("ARK_F9_SPLIT_BLEND") != NULL;
+    static uint64_t split_frame = ~0ull;
+    static int nsplit;
+    if (split && g_debug_frame && in_pass && st.rt.depth && (st.color_state[0] & 1)) {
+        if (renderer_present_count() != split_frame) { split_frame = renderer_present_count(); nsplit = 0; }
+        if (nsplit++ < 80) { LOG("[draw]   (split: pass ends here)\n"); vk_end_pass(); }
+    }
 }
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
