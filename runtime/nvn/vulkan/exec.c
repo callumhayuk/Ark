@@ -910,6 +910,15 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         return;
     }
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
+#if defined(__APPLE__)
+    // MoltenVK: a depth+stencil vkCmdClearAttachments left the stencil as it was (the opening's silhouette effect marks
+    // stencil every frame after such a clear; the marks of every earlier frame stayed: dark trails behind the
+    // figures). Stencil clears go through the clear pipeline here, an ordinary draw writing stencil with REPLACE (and
+    // depth through the vertex position). ARK_MVK_NATIVE_DS_CLEAR=1: vkCmdClearAttachments again, for comparison.
+    static int native_ds = -1;
+    if (native_ds < 0) native_ds = getenv("ARK_MVK_NATIVE_DS_CLEAR") != NULL;
+    if (stencil && pass_stencil && !native_ds) simple = false;
+#endif
     if (g_debug_frame)
         LOG("[clear] rt %d mask %#x depth %d (%g, has %d) stencil %d (%#x, write mask %#x, has %d) rect %d,%d %ux%u via %s\n",
             index, mask, depth, dval, pass_depth != VK_FORMAT_UNDEFINED, stencil, sval, smask, pass_stencil != VK_FORMAT_UNDEFINED,
