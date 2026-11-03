@@ -13,10 +13,13 @@ uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
     (void)arg;
-    const uint64_t period = 16666667;
-    plat_thread_realtime(period);
+    extern int ark_speed(void);  // (runtime/patches.c: F8 / ARK_SPEED: the timer runs that much faster, 16x if unlimited)
+    const uint64_t base = 16666667;
+    plat_thread_realtime(base);
     uint64_t next = plat_now_ns();
     for (;;) {
+        int sp = ark_speed();
+        const uint64_t period = base / (uint64_t)(sp ? sp : 16);
         next += period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();

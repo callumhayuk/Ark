@@ -688,10 +688,14 @@ static void present_pace(int interval) {
     if (forced >= 0) interval = forced;
     static int logged = -1;
     if (interval != logged) { logged = interval; LOG("[nvn] present interval %d (%s)\n", interval, interval > 0 ? "paced" : "unpaced"); }
-    if (interval <= 0) return;
+    extern int ark_speed(void);  // (runtime/patches.c: F8 / ARK_SPEED, x1 x2 x4 or 0 unlimited)
+    int sp = ark_speed();
+    if (interval <= 0 || sp == 0) return;
     static uint64_t next;
+    static int last_sp = 1;
+    if (sp != last_sp) { last_sp = sp; next = 0; }  // (speed changed: start the schedule again)
     const uint64_t vsync = 16666667ull;  // 60 Hz
-    uint64_t period = (uint64_t)interval * vsync, now = plat_now_ns();
+    uint64_t period = (uint64_t)interval * vsync / (uint64_t)sp, now = plat_now_ns();
     if (!next || now > next + 4 * period) next = now;  // first present, or far behind (a load): don't race to catch up
     else if (next > now) plat_sleep_until_ns(next);
     next += period;

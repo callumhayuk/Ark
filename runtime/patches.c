@@ -192,3 +192,25 @@ void ark_switch_toggle(int which) {
     static const char *names[] = {"60 fps", "full-detail models", "grass to its limit", "text at 30 fps pace", "second frame table halved"};
     if (which >= 0 && which < 5) LOG("[switch] %s: %s\n", names[which], ark_switch_get(which) ? "on" : "off");
 }
+
+// Ark: game speed for testing. The game advances one fixed step per presented frame, paced by Ark at the present
+// interval (nvn/objects.c present_pace) and by the 60 Hz vsync timer (hle/vi.c); both run ark_speed() times faster.
+// 0: no pacing (as fast as the machine runs it; the vsync timer at 16x). ARK_SPEED=1|2|4|0 at start; F8 in the window
+// cycles x1 -> x2 -> x4 -> unlimited. Audio follows the game, so it may stutter or change pitch above x1.
+static int speed = -1;
+int ark_speed(void) {
+    if (speed < 0) {
+        const char *e = getenv("ARK_SPEED");
+        speed = e ? atoi(e) : 1;
+        if (speed < 0) speed = 1;
+        if (speed > 16) speed = 16;
+        if (speed != 1) LOG("[speed] game speed %s (ARK_SPEED)\n", speed ? "raised" : "unlimited");
+    }
+    return speed;
+}
+void ark_speed_cycle(void) {
+    int s = ark_speed();
+    speed = s == 1 ? 2 : s == 2 ? 4 : s == 4 ? 0 : 1;
+    if (speed) LOG("[speed] game speed x%d\n", speed);
+    else LOG("[speed] game speed: unlimited\n");
+}

@@ -221,3 +221,38 @@ This environment is ephemeral. To get back to the current state:
    `https://github.com/Kron4ek/Wine-Builds/releases/download/9.20/wine-9.20-amd64-wow64.tar.xz`.
 6. Useful while debugging: `gdb --args build/ark <dir>`, break on `f_<guest addr>`; the `Cpu *` is in `rdi`.
    Symbol names for guest addresses come from the NSOs' symbol tables (the SDK's exports name almost everything).
+
+## 2026-11-03: name entry, character self-shadowing, speed toggle
+
+- **Name entry** (`runtime/hle/swkbd.c`, `runtime/ui_prompt.c`): the game wants the keyboard's answer in **UTF-16**
+  (`KeyboardConfig.isUseUtf8`, +0x3bd, is 0). Ark wrote UTF-8, so "Ark" was read as U+7241 '牁' + 'k': the
+  "one kanji" name. The answer now follows the flag and is cut to `textMaxLength` (UTF-16 units, whole characters).
+  Windowed builds ask with a native text box on the window's thread (`SDL_RunOnMainThread`): an NSAlert with a
+  keyboard symbol on macOS (through the Objective-C runtime; links `objc` + AppKit), an in-memory dialog template on
+  Windows, zenity / kdialog on Linux. IME input works. The box shows the game's header / guide text ("What is your
+  name?") and starts from its initial text; closing it gives the game window the keyboard back (`SDL_RaiseWindow`).
+  Cancel or an empty answer keeps the initial text (else "Ark"). `ARK_KEYBOARD_TEXT=<name>` answers without asking
+  (scripted runs, headless builds, where `ui_prompt.c` is left out).
+- **Characters shadowed themselves** (white clothes and the starter Pokémon covered in flickering grey facets and
+  streaks). Legends: Arceus shades in a deferred pass; its screen-space shadows (`8244a26000`/`8244a26200`) compare
+  each pixel's depth with the cascades (D32F 1024x1024x2, filtered by the game's own 16-tap compare) and also fetch
+  the casters' **object ids** from an R32_UINT array beside them (format 0x03, written by the casters' `c1`): a
+  surface of class 2 / 3 (G-buffer alpha bits 6..7) is not shadowed by its own id. Two translator bugs broke that:
+  1. **TLDS 2D-array LOD-zero** (texs info 8) took x from Ra+1 and y from Rb; Maxwell's layout is layer Ra, x Rb,
+     y Rb+1 (Ryujinx `TldsTarget.Texture2DArrayLodZero`). Every id lookup read the wrong texel, so the self-shadow
+     check failed everywhere: not specific to macOS (`maxwell/translate.c glsl_texs` and the MSL twin).
+  2. **Integer textures read through float samplers** (undefined in Vulkan; Maxwell returns the raw bits, MoltenVK on
+     Apple GPUs need not). `ShaderKey.tex_uint` / `tex_sint` (per handle slot, filled per draw in `exec.c draw_` from
+     the bound textures' formats, part of the program hash) make those slots `usampler` / `isampler` with `uvec4` /
+     `ivec4` results (`tex_int_kind`).
+  Ruled out on the way, and not kept: polygon offset (the casters draw without it, D32F), MoltenVK fast math, filter
+  precision (in-shader exact bilinear), sampler compare / filter support, depth snapshot reuse, cascade layers,
+  skinning data. Diagnosis that worked: hiding the shadow map, then a test bias on the cascade reads (0.01 needed:
+  far beyond precision), then reading the screen-space pass's GLSL from an F9 dump.
+- **Diagnostics kept:** `ARK_LOG_SHADOW=1` logs each kind of draw into a square 512..4096 target (the cascades) once,
+  with formats, stages, polygon offset and why a draw was skipped; F9 also saves each cascade layer after its pass
+  (`build/shadow_L<n>.pgm`, raw floats in `.f32`).
+- **Game speed** (`runtime/patches.c ark_speed`): F8 cycles x1 -> x2 -> x4 -> unlimited (window title), `ARK_SPEED=
+  1|2|4|0` at start. Scales Ark's present pacing (`nvn/objects.c present_pace`) and the 60 Hz vsync timer
+  (`hle/vi.c`); audio follows the game's pace.
+- **CMake headless builds** leave `ui_prompt.c` out (the regex in `CMakeLists.txt` of the PLARecomp folder).

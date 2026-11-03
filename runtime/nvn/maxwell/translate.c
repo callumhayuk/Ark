@@ -519,10 +519,23 @@ static const char *tex_type_name(int t) {
     }
 }
 
+// Ark: 2 if texture slot `slot` is bound to an unsigned integer format at this draw, 1 signed, 0 float (key->tex_uint /
+// tex_sint, by handle slot). Such slots are declared usampler / isampler and their results stay integers: an integer
+// texture read through a float sampler is undefined in Vulkan. Maxwell returns the raw bits; MoltenVK on Apple GPUs
+// need not (the shadow casters' object ids, an R32_UINT array beside the cascades, read by the screen-space shadows).
+static int tex_int_kind(const Ctx *c, const ShaderTexture *t) {
+    if (!c->glsl || !c->key || t->shadow || t->bindless) return 0;
+    int hs = ((int)t->handle_offset - 0x20) / 8;
+    if (hs < 0 || hs >= 32) return 0;
+    if ((c->key->tex_uint >> hs) & 1) return 2;
+    if ((c->key->tex_sint >> hs) & 1) return 1;
+    return 0;
+}
+
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
-    sp(&c->body, "    { float4 t = %s;\n", call);
-    (void)slot;
+    int ik = slot >= 0 && slot < c->info->ntex ? tex_int_kind(c, &c->info->tex[slot]) : 0;
+    sp(&c->body, "    { %s t = %s;\n", ik == 2 ? "uvec4" : ik == 1 ? "ivec4" : "float4", call);
     if (f16) {
         // TEXS/TLDS .F16: components (in mask order) packed as half pairs into d0 (lo, hi) and d1 (lo, hi)
         int comps[4], n = 0;
@@ -689,7 +702,10 @@ static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call,
         case 7: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
             sprintf(call, "texelFetch(t%d, ivec3(%s, %s, %s), 0)", slot, A, A1, Bv); break;
         case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);
-            sprintf(call, "texelFetch(t%d, ivec3(ivec2(%s), int(%s)), 0)", slot, RSC2(c, slot, "uint2(%s, %s)", A1, Bv), A); break;
+            // 2D array, LOD 0: layer Ra, x Rb, y Rb+1 (Ryujinx TldsTarget.Texture2DArrayLodZero). This read x from Ra+1
+            // and y from Rb: the shadow casters' object-id lookups (screen-space shadows) hit the wrong texels, the
+            // game's "a character doesn't shadow itself" check failed, and characters were covered in grey facets.
+            sprintf(call, "texelFetch(t%d, ivec3(ivec2(%s), int(%s)), 0)", slot, RSC2(c, slot, "uint2(%s, %s)", Bv, B1), A); break;
         case 12: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
             sprintf(call, "texelFetch(t%d, ivec2(%s), int(%s))", slot, RSC2(c, slot, "uint2(int2(%s, %s) + int2(int(%s << 28) >> 28, int(%s << 24) >> 28))", A, A1, B1, B1), Bv); break;
         default: fail(c, "tlds info %d", info); return false;
@@ -769,8 +785,8 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
             sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", A, A1), Bv); break;
         case 7: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
             sprintf(call, "t%d.read(uint3(%s, %s, %s))", slot, A, A1, Bv); break;
-        case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);
-            sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", A1, Bv), A); break;
+        case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);  // (layer Ra, x Rb, y Rb+1: see glsl_texs)
+            sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", Bv, B1), A); break;
         case 12: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
             sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(int2(%s, %s) + int2(int(%s << 28) >> 28, int(%s << 24) >> 28))", A, A1, B1, B1), Bv); break;
         default: fail(c, "tlds info %d", info); return;
@@ -1987,7 +2003,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
-        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
+        int ik = tex_int_kind(c, t);
+        sp(&s, "layout(set = %d, binding = %d) uniform %s%s t%d;\n", set, 32 + i, ik == 2 ? "u" : ik == 1 ? "i" : "",
+           glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
         case TEXTYPE_1D: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1, 1); }\n", i, i); break;

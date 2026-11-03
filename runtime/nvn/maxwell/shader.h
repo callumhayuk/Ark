@@ -42,6 +42,8 @@ typedef struct {
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint8_t xfb;            // vertex: transform feedback is active: also write maxwell_xfb's outputs to memory
+    uint32_t tex_uint;      // texture handle slots (0..31, cbuf offset 0x20 + 8 i) bound to unsigned / signed integer
+    uint32_t tex_sint;      // formats: usampler / isampler, results kept as integers (GLSL only; see tex_int_kind)
 } ShaderKey;
 
 // Ark: transform feedback layout of a vertex program (from its NVN control section). Buffer b holds, per vertex,

@@ -57,7 +57,7 @@ RT_SRC   := $(wildcard runtime/*.c) $(PLATFORM) $(wildcard runtime/services/*.c)
 HEADLESS ?= 0
 ifeq ($(HEADLESS),1)
 # no renderer, no SDL: the NVN layer, input and the menu hooks stay out
-RT_SRC   := $(filter-out runtime/ui_none.c runtime/hle/input.c runtime/hle/bindings.c runtime/hotkeys.c,$(RT_SRC))
+RT_SRC   := $(filter-out runtime/ui_none.c runtime/ui_prompt.c runtime/hle/input.c runtime/hle/bindings.c runtime/hotkeys.c,$(RT_SRC))
 RTDEFS   := -DARK_HEADLESS -Iruntime/headless $(if $(DEPS),-I$(DEPS)/include)
 LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib) -lopus -lpthread -lm -ldl
 else
@@ -66,10 +66,10 @@ RT_CXX   := $(wildcard runtime/nvn/vulkan/*.cpp)
 RTDEFS   := $(if $(DEPS),-I$(DEPS)/include) -Iruntime/nvn -I$(B)/inc -Ithird_party/smaa/Textures
 ifeq ($(OS),Windows_NT)
 LDLIBS   := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lvulkan-1 -lshaderc_shared -lopus \
-            -lstdc++ -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lpthread
+            -lstdc++ -lwinmm -lole32 -lshell32 -lcomdlg32 -luser32 -luuid -lpthread
 else ifeq ($(shell uname -s),Darwin)
 # macOS: Vulkan through MoltenVK (Homebrew vulkan-loader + molten-vk); Apple's C++ library is libc++
-LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib -Wl,-rpath,$(DEPS)/lib) -lSDL3 -lvulkan -lshaderc_shared -lopus -lc++ -lpthread -lm
+LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib -Wl,-rpath,$(DEPS)/lib) -lSDL3 -lvulkan -lshaderc_shared -lopus -lc++ -lpthread -lm -lobjc -framework AppKit
 else
 LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib -Wl,-rpath,$(DEPS)/lib) -lSDL3 -lvulkan -lshaderc_shared -lopus -lstdc++ -lpthread -lm -ldl
 endif

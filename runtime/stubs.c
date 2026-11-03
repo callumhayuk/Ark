@@ -20,15 +20,16 @@ void flags_ext_save_written(const char *path, uint64_t addr, int64_t off, int64_
 // LAS's romfs read hook (randomizer bookkeeping): nothing to do.
 void romfs_file_read_hook(const char *path) { (void)path; }
 
-// Software keyboard text entry. LAS asks through its overlay menu; Ark has no UI yet, so the answer comes from
-// ARK_KEYBOARD_TEXT (default "Ark"). NOTE: runtime/hle/swkbd.c reads ShowKeyboardArg offsets probed on LAS's SDK
-// version; check them against Legends: Arceus's SDK before relying on the initial text.
-int menu_keyboard_run(const char *initial, int max_len, char *out, int cap) {
-    (void)initial; (void)max_len;
+#ifdef ARK_HEADLESS
+// Software keyboard text entry without a window (runtime/hle/swkbd.c): ARK_KEYBOARD_TEXT, else the game's initial
+// text, else "Ark". Windowed builds ask with a native text box (runtime/ui_prompt.c).
+int menu_keyboard_run(const char *title, const char *prompt, const char *initial, int max_len, char *out, int cap) {
+    (void)title; (void)prompt; (void)max_len;
     const char *t = getenv("ARK_KEYBOARD_TEXT");
-    snprintf(out, (size_t)cap, "%s", t ? t : "Ark");
+    snprintf(out, (size_t)cap, "%s", t ? t : initial && initial[0] ? initial : "Ark");
     return 1;
 }
+#endif
 
 #ifdef ARK_HEADLESS
 // Headless build (no NVN renderer): the frame counter and 60 fps switch that runtime/patches.c asks the renderer for.

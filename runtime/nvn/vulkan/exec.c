@@ -637,6 +637,9 @@ static int debug_pass_no;
 
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
+static NvnTexture *shadow_pass_tex;  // (F9) the current pass draws into this shadow-cascade layer
+static uint32_t shadow_pass_layer;
+static void debug_save_shadow(NvnTexture *t, uint32_t layer);
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
@@ -644,6 +647,7 @@ static void vk_end_pass_at(int line) {
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
     if (xfb_pass) { xfb_pass = false; return; }
+    if (shadow_pass_tex) { NvnTexture *t = shadow_pass_tex; shadow_pass_tex = NULL; debug_save_shadow(t, shadow_pass_layer); }
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
@@ -728,6 +732,12 @@ static void begin_pass(void) {
     }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
+    shadow_pass_tex = NULL;
+    if (g_debug_frame && st.rt.depth && st.rt.depth->width == st.rt.depth->height && st.rt.depth->width >= 512 &&
+        st.rt.depth->target == 4) {  // (F9: the shadow cascades, saved when the pass ends: debug_save_shadow)
+        shadow_pass_tex = st.rt.depth;
+        shadow_pass_layer = st.rt.has_dview && (st.rt.dview.setmask & 2) ? st.rt.dview.min_layer : 0;
+    }
     if (st.rt.depth) {
         renderer_mark_gpu_owned(st.rt.depth);
         VkImageView v = vk_view(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
@@ -1177,6 +1187,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    for (int i = 0; i < 64; i++) { h ^= (uint64_t)(i < 32 ? fkey->tex_uint >> i : fkey->tex_sint >> (i - 32)) & 1; h *= 0x100000001B3ull; }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -1623,6 +1634,38 @@ static void debug_save_depth(TexBackend *b, const char *path) {
     for (uint64_t i = 0; i < n; i++) fputc(hi > lo ? (int)((d[i] - lo) / (hi - lo) * 255.0f) : 0, f);
     fclose(f);
     LOG("[vk] saved %s (%ux%u depth %.6f..%.6f)\n", path, b->width, b->height, lo, hi);
+}
+
+// (F9) a shadow-cascade layer after each pass into it (the last one wins): build/shadow_L<layer>.pgm (scaled to its
+// depth range, the first word of the log line) and build/shadow_L<layer>.f32 (the raw floats, row by row)
+static void debug_save_shadow(NvnTexture *t, uint32_t layer) {
+    TexBackend *b = t->backend;
+    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    if (b->format != VK_FORMAT_D32_SFLOAT && b->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
+    if (layer >= b->layers) return;
+    uint64_t n = (uint64_t)b->width * b->height;
+    VkSpan out = vk_readback(n * 4);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, layer, 1},
+                           .imageExtent = {b->width, b->height, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    renderer_flush();
+    const float *d = out.ptr;
+    float lo = 1e30f, hi = -1e30f;
+    for (uint64_t i = 0; i < n; i++) if (d[i] < 1.0f) { if (d[i] < lo) lo = d[i]; if (d[i] > hi) hi = d[i]; }
+    char path[96];
+    snprintf(path, sizeof path, "build/shadow_L%u.f32", layer);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(d, 4, n, f); fclose(f); }
+    snprintf(path, sizeof path, "build/shadow_L%u.pgm", layer);
+    f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P5 %u %u 255\n", b->width, b->height);
+    for (uint64_t i = 0; i < n; i++) fputc(d[i] >= 1.0f ? 255 : hi > lo ? (int)((d[i] - lo) / (hi - lo) * 254.0f) : 0, f);
+    fclose(f);
+    static int nlog;
+    if (nlog++ < 64) LOG("[shadow] saved %s (%ux%u, depth below 1: %.6f..%.6f)\n", path, b->width, b->height, lo, hi);
 }
 
 // (debug frames, LARECOMP_DUMP_R8=1) an R8 image's level 0 as a PGM: what the GPU actually samples
@@ -2180,10 +2223,54 @@ static void draw(CmdRec *r, bool indexed) {
         if (nsplit++ < 80) { LOG("[draw]   (split: pass ends here)\n"); vk_end_pass(); }
     }
 }
+// ARK_LOG_SHADOW=1: every distinct kind of draw into a square render target of 512..4096 (the shadow cascades), once:
+// its targets, polygon offset and program stages, and why it was skipped if it was (shadow acne, 2026-11-02).
+static bool shadow_log_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARK_LOG_SHADOW") && strcmp(getenv("ARK_LOG_SHADOW"), "0");
+    return on;
+}
+static bool shadow_target(void) {
+    const NvnTexture *t = st.rt.depth ? st.rt.depth : st.rt.ncolor ? st.rt.color[0] : NULL;
+    return t && t->width == t->height && t->width >= 512 && t->width <= 4096;
+}
+static uint64_t shadow_sig;  // the current draw's signature (0: not a shadow draw / not logging)
+static bool shadow_new(uint64_t sig) {
+    static uint64_t seen[256];
+    static int n;
+    for (int i = 0; i < n; i++) if (seen[i] == sig) return false;
+    if (n < 256) seen[n++] = sig;
+    return n < 256;
+}
+static void shadow_log_draw(void) {
+    shadow_sig = 0;
+    if (!shadow_log_on() || !shadow_target() || !st.program) return;
+    const NvnTexture *d = st.rt.depth, *c0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+    uint64_t vs = st.program->stage_mask & 1 ? st.program->stages[0].code_addr : 0;
+    uint64_t fs = st.program->stage_mask & 2 ? st.program->stages[1].code_addr : 0;
+    uint64_t sig = vs * 0x9E3779B97F4A7C15ull ^ fs ^ (uint64_t)st.program->stage_mask << 56 ^ (uint64_t)(st.poly[3] & 7) << 48 ^
+                   (uint64_t)(d ? d->format : 0) << 40 ^ (uint64_t)(c0 ? c0->format : 0) << 32 ^ (uint64_t)st.discard << 60;
+    shadow_sig = sig;
+    if (!shadow_new(sig)) return;
+    LOG("[shadow] draw: depth %s fmt %#x %ux%ux%u target %u | color0 %s fmt %#x | ncolor %d | stages %#x vs %llx fs %llx | "
+        "poly offset enables %#x factor %g units %g clamp %g | depth range %g..%g | depth test %d write %d func %d | "
+        "discard %d | depth mode %u | frame %llu\n",
+        d ? "yes" : "no", d ? d->format : 0, d ? d->width : 0, d ? d->height : 0, d ? d->depth : 0, d ? d->target : 0,
+        c0 ? "yes" : "no", c0 ? c0->format : 0, st.rt.ncolor, st.program->stage_mask, (unsigned long long)vs,
+        (unsigned long long)fs, st.poly[3], st.poly_offset[0], st.poly_offset[1], st.poly_offset[2], st.depth_range[0][0],
+        st.depth_range[0][1], st.ds[0], st.ds[1], st.ds[2], st.discard, nvn_depth_mode(),
+        (unsigned long long)renderer_present_count());
+}
+static void shadow_log_skip(const char *why, const char *detail) {
+    if (!shadow_sig || !shadow_new(shadow_sig ^ 0x5bd1e995ull)) return;
+    LOG("[shadow]   ^ skipped: %s%s%s\n", why, detail && *detail ? ": " : "", detail ? detail : "");
+}
+
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { stat_skipped++; return; }
+    shadow_log_draw();
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
@@ -2193,7 +2280,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // Ark: transform feedback. A capturing draw runs only its vertex shader (rasterizer discard), in a pass of its own
     // (xfb_begin_pass), its outputs stored to the bound buffers; with discard on and nothing captured, nothing is drawn.
     bool xfb_draw = st.xfb_active && (st.program->stage_mask & 1) && xfb_program(st.program->stages[0].control);
-    if (st.discard && !xfb_draw) { stat_skipped++; return; }
+    if (st.discard && !xfb_draw) { stat_skipped++; shadow_log_skip("rasterizer discard", NULL); return; }
     if (xfb_draw) {
         vkey.xfb = 1;
         memset(fkey.rt_kind, 0, sizeof fkey.rt_kind);
@@ -2203,10 +2290,29 @@ static void draw_(CmdRec *r, bool indexed) {
                                indexed ? "indexed (vertex order assumed)" : "arrays");
         }
     }
+    // integer-format textures bound to each stage's handle slots (ShaderKey.tex_uint / tex_sint: usampler / isampler)
+    if (st.tpool) {
+        for (int sg = 0; sg < 2; sg++) {
+            ShaderKey *k = sg ? &fkey : &vkey;
+            for (int hs = 0; hs < 32; hs++) {
+                uint64_t h = st.tex[sg][hs];
+                uint32_t tic = h & 0xFFFFF;
+                if (!h || tic >= (uint32_t)st.tpool->count) continue;
+                const NvnTexEntry *e = &((const NvnTexEntry *)st.tpool->entries)[tic];
+                if (!e->tex) continue;
+                uint32_t f = e->has_view && (e->view.setmask & 4) ? e->view.format : e->tex->format;
+                int ik = renderer_format_is_depth(e->tex->format) ? 0 : rt_kind(f);
+                if (ik == 2) k->tex_uint |= 1u << hs;
+                else if (ik == 1) k->tex_sint |= 1u << hs;
+            }
+        }
+    }
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || atomic_load(&pr->state) != 1) {
         stat_skipped++;
         if (pr && atomic_load(&pr->state) == 2) stat_skip_failed++; else stat_skip_prog++;
+        shadow_log_skip(!pr ? "no program (stages not drawn)" : atomic_load(&pr->state) == 2 ? "program failed" : "program not ready",
+                        pr && atomic_load(&pr->state) == 2 && pr->vi ? pr->vi->error : NULL);
         return;
     }
     {   // fragment-shader hash: interior backdrop detection (widescreen), skip lists, item twinkle (renderer.m)
@@ -2256,6 +2362,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!native && mode != 6 && mode != 7 && mode != 9) {
         stat_skipped++;
         stat_skip_mode++;
+        shadow_log_skip("primitive mode not drawn", NULL);
         static uint32_t seen;
         if (mode < 32 && !(seen & (1u << mode))) { seen |= 1u << mode; LOG("[vk] draws with primitive mode %u are not drawn\n", mode); }
         return;
@@ -2320,7 +2427,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (atomic_load(&pp->state) != 1) { stat_skipped++; stat_skip_pipe++; return; }
+    if (atomic_load(&pp->state) != 1) { stat_skipped++; stat_skip_pipe++; shadow_log_skip("pipeline not ready / failed", NULL); return; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
