@@ -19,7 +19,7 @@ small (~35 ms per second), so the cost is in the game's threads (being profiled 
 | 1. Translate all code to C, compile it | **done** |
 | 2. Headless boot to the first GPU call | **done** (Linux x86-64) |
 | 3. NVN on Vulkan + shader translation: first frame | **done**: logo, language menu, opening scene with text |
-| 4. Audio out, input, saves, the field | later |
+| 4. Audio out, input, saves, the field | saves **done** (load and save round trip, emulator saves load); the rest in progress |
 
 ## 60 fps (ARK_60FPS=1), what is known (2026-10-18)
 
@@ -256,3 +256,20 @@ This environment is ephemeral. To get back to the current state:
   1|2|4|0` at start. Scales Ark's present pacing (`nvn/objects.c present_pace`) and the 60 Hz vsync timer
   (`hle/vi.c`); audio follows the game's pace.
 - **CMake headless builds** leave `ui_prompt.c` out (the regex in `CMakeLists.txt` of the PLARecomp folder).
+
+## 2026-11-03: saves
+
+- **Save data works end to end.** `fsp-srv` OpenSaveDataFileSystem mounts the host folder `save/save_0/` (beside the
+  working directory; `LARECOMP_SAVE_DIR` overrides it) and every IFileSystem / IFile call goes straight to host files.
+  The game keeps three files there: `main` and `backup` (1,289,478 bytes each at v1.1.1, encrypted by the game
+  itself) and `main2` (8 bytes). Tested on macOS: a save made on an emulator loads (the game skips the language menu
+  and continues), saving in game overwrites it, and a new session loads the overwritten save.
+- **Using a save from an emulator or a console:** copy the title's save folder contents (`main`, `backup`, `main2`)
+  into `save/save_0/`. It must be a v1.1.1 save. There is no Switch-style journaling: a write goes to disk at once
+  and Commit does nothing, so a crash mid-save can leave a torn file. Keep a copy of saves worth keeping.
+- **Folder name:** `save_%u` takes byte 0x8 + 0x18 of the request (the low byte of `attribute.system_save_data_id`,
+  0 for the game's account save), not `attribute.type` (0x8 + 0x20). Harmless, left as is so existing save folders
+  stay where they are.
+- **Logging:** `[save] open / create / read / write` lines in `ark.log` for every save-data mount (they used to fire
+  only for paths containing "savedata", a leftover from LAS Recomp, so never for this game).
+- `save/` is git-ignored: save files are the player's, not source.

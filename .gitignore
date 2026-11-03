@@ -5,6 +5,8 @@ dump/
 extracted/
 generated/
 build/
+save/
+cache/
 *.nso
 *.nca
 *.nsp

@@ -421,8 +421,8 @@ static Service *open_romfs_storage(void) {
 }
 
 // ------------------------------------------------------------------ host-directory filesystem
-typedef struct { char root[1024]; } HostFs;
-typedef struct { int fd; char path[1100]; } HostFile;
+typedef struct { char root[1024]; bool save; } HostFs;  // save: a save-data mount (logged as [save])
+typedef struct { int fd; char path[1100]; bool save; } HostFile;
 typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
 
 static const char *in_path(IpcReq *req, int i) {
@@ -451,7 +451,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
         plat_commit(b->addr, size);  // (see the storage read)
         ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
-        if (strstr(f->path, "savedata")) {
+        if (f->save) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
             extern void save_editor_file_read(const char *path, uint64_t addr, int64_t off, int64_t size);
             save_editor_file_read(f->path, b->addr, off, n);
@@ -465,10 +465,10 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
     case 1: {  // Write(option, offset, size) <- A
         int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
         IpcBuf *a = in_buf(req, 0);
-        if (strstr(f->path, "savedata"))
+        if (f->save)
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
         if (pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off) < 0) resp->result = errno_result();
-        else if (strstr(f->path, "savedata")) {
+        else if (f->save) {
             extern void flags_ext_save_written(const char *path, uint64_t addr, int64_t off, int64_t size);
             flags_ext_save_written(f->path, a->addr, off, size);
         }
@@ -557,6 +557,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     host_path(fs, in_path(req, 0), p, sizeof p);
     switch (req->cmd) {
     case 0: {  // CreateFile(option, size)
+        if (fs->save) LOG("[save] create %s size %lld\n", p, (long long)IN(int64_t, 8));
         int fd = open(p, O_CREAT | O_EXCL | O_RDWR, 0644);
         if (fd < 0) { resp->result = errno_result(); break; }
         if (ftruncate(fd, IN(int64_t, 8))) resp->result = errno_result();
@@ -581,9 +582,15 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     case 8: {  // OpenFile(mode)
         uint32_t mode = IN(uint32_t, 0);
         int fd = open(p, (mode & 2) ? O_RDWR : O_RDONLY);
-        if (fd < 0) { resp->result = errno_result(); break; }
+        if (fd < 0) {
+            resp->result = errno_result();
+            if (fs->save) LOG("[save] open %s (mode %u) -> not found\n", p, mode);
+            break;
+        }
+        if (fs->save) LOG("[save] open %s (mode %u)\n", p, mode);
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
+        f->save = fs->save;
         strlcpy(f->path, p, sizeof f->path);
         ipc_return_object(resp, service_new("IFile", file, f));
         break;
@@ -606,8 +613,9 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     }
 }
 
-static Service *open_host_fs(const char *sub) {
+static Service *open_host_fs(const char *sub, bool save) {
     HostFs *fs = calloc(1, sizeof *fs);
+    fs->save = save;
     if (getenv("LARECOMP_SAVE_DIR")) g_save_dir = getenv("LARECOMP_SAVE_DIR");  // test runs use a scratch copy
     else if (rando_seed_dir()) {  // each randomizer seed has its own save slots
         static char seed_save[600];
@@ -629,13 +637,15 @@ SERVICE("fsp-srv", fsp_srv) {
     (void)s;
     switch (req->cmd) {
     case 1: break;  // SetCurrentProcess
-    case 18: ipc_return_object(resp, open_host_fs("sdcard")); break;
+    case 18: ipc_return_object(resp, open_host_fs("sdcard", false)); break;
     case 22: break;  // CreateSaveDataFileSystem
     case 51: case 53: {  // OpenSaveDataFileSystem(space, attribute)
-        uint8_t type = IN(uint8_t, 0x8 + 0x18);  // attribute.type
+        // (0x8 + 0x18 is attribute.system_save_data_id's low byte, 0 for the game's account save, so the save lives
+        // in save/save_0; attribute.type is at 0x8 + 0x20. Kept as is so existing save folders stay where they are.)
+        uint8_t type = IN(uint8_t, 0x8 + 0x18);
         char sub[64];
         snprintf(sub, sizeof sub, "save_%u", type);
-        ipc_return_object(resp, open_host_fs(sub));
+        ipc_return_object(resp, open_host_fs(sub, true));
         break;
     }
     case 200: ipc_return_object(resp, open_romfs_storage()); break;  // OpenDataStorageByCurrentProcess
