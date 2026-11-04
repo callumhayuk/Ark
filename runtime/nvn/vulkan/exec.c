@@ -499,6 +499,34 @@ static void *translator(void *a) {
     }
     return NULL;
 }
+// A draw whose program or pipeline is still building waits for it a little before being skipped: one-shot draws (a
+// menu's frosted-glass capture, drawn once when the menu opens) are otherwise lost for good. Each wait is capped at
+// ARK_SHADER_WAIT_MS (default 50) and all waits in one frame at ARK_SHADER_WAIT_FRAME_MS (default 100), so entering a
+// new area (dozens of builds at once) still hitches at most that much per frame; 0 turns the wait off.
+static uint64_t wait_frame = ~0ull, wait_used_ns;
+static uint64_t stat_build_waits, stat_build_wait_ns;
+uint64_t renderer_present_count(void);
+static bool wait_build(_Atomic int *state) {
+    if (atomic_load(state) != 0) return atomic_load(state) == 1;
+    static int64_t per = -1, frame = -1;
+    if (per < 0) {
+        const char *e = getenv("ARK_SHADER_WAIT_MS"), *f = getenv("ARK_SHADER_WAIT_FRAME_MS");
+        per = (e ? atoll(e) : 50) * 1000000ll;
+        frame = (f ? atoll(f) : 100) * 1000000ll;
+    }
+    uint64_t now = renderer_present_count();
+    if (now != wait_frame) { wait_frame = now; wait_used_ns = 0; }
+    if (per <= 0 || (int64_t)wait_used_ns >= frame) return false;
+    uint64_t t0 = SDL_GetTicksNS(), cap = (uint64_t)per;
+    if (cap > (uint64_t)frame - wait_used_ns) cap = (uint64_t)frame - wait_used_ns;
+    while (atomic_load(state) == 0 && SDL_GetTicksNS() - t0 < cap) SDL_DelayNS(100000);  // (0.1 ms polls)
+    uint64_t dt = SDL_GetTicksNS() - t0;
+    wait_used_ns += dt;
+    stat_build_waits++;
+    stat_build_wait_ns += dt;
+    return atomic_load(state) == 1;
+}
+
 static bool sync_shaders(void);
 static void run_translate(void (*fn)(void *), void *arg) {
     if (sync_shaders()) { fn(arg); return; }
@@ -611,13 +639,15 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped (prog %llu failed %llu mode %llu pipe %llu), %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu, upload %.1fMB",
+             "%llu draws, %llu skipped (prog %llu failed %llu mode %llu pipe %llu), %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu, upload %.1fMB, build waits %llu (%.0fms)",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_skip_prog,
              (unsigned long long)stat_skip_failed, (unsigned long long)stat_skip_mode, (unsigned long long)stat_skip_pipe,
              (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
+             atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0,
+             (unsigned long long)stat_build_waits, (double)stat_build_wait_ns / 1e6);
     stat_feedback_copies = stat_upload_bytes = 0;
+    stat_build_waits = stat_build_wait_ns = 0;
     if (prof) {
         prof_up = prof_up_ns;
         prof_up_ns = 0;
@@ -2576,6 +2606,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
+    if (cp && atomic_load(&cp->p.state) == 0) wait_build(&cp->p.state);
     if (!cp || atomic_load(&cp->p.state) != 1) {
         if (g_debug_frame || backdrop_tracing()) debug_dispatch(cp, gx, gy, gz, !cp ? "SKIPPED (no program)" : atomic_load(&cp->p.state) == 2 ? "SKIPPED (failed)" : "SKIPPED (building)");
         stat_skipped++;
@@ -2735,6 +2766,7 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    if (pr && atomic_load(&pr->state) == 0) wait_build(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) {
         stat_skipped++;
         if (pr && atomic_load(&pr->state) == 2) stat_skip_failed++; else stat_skip_prog++;
@@ -2858,6 +2890,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
+    if (atomic_load(&pp->state) == 0) wait_build(&pp->state);
     if (atomic_load(&pp->state) != 1) { stat_skipped++; stat_skip_pipe++; shadow_log_skip("pipeline not ready / failed", NULL); return; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;

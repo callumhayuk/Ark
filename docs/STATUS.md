@@ -379,7 +379,9 @@ depth-of-field blur (cb3[113] focus range set so that all depths are out of focu
 (fs 8244915200) moves it into the texture the menu's HUD draws sample. Three bugs, one per stage:
 
 1. **Black:** the copy draw is one-shot. With asynchronous shader builds it was skipped (program not ready) and never
-   re-run. LARECOMP_SYNC_SHADERS=1 shows it; a skip policy that waits briefly is still to do.
+   re-run. Fixed: a draw / dispatch whose program or pipeline is still building now waits for it (at most
+   ARK_SHADER_WAIT_MS, default 50, per draw and ARK_SHADER_WAIT_FRAME_MS, default 100, per frame; 0 off) before
+   being skipped. The stats line reports "build waits N (X ms)". Area loads are no more stuttery than before.
 2. **Too dark:** NVN texture copies are raw texel copies; Ark blitted between the two formats, which decoded the sRGB.
    Unscaled copies between colour formats of the same texel size now use vkCmdCopyImage (Vulkan allows
    size-compatible formats). ARK_COPY_CONVERT=1 restores the blit.
