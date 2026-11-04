@@ -370,3 +370,29 @@ This environment is ephemeral. To get back to the current state:
 - Debug tooling added on the way: F9 prints each fragment texture's sampler and effective swizzle, and with
   LARECOMP_DEBUG_DATA its byte count / 0xFF count / first bytes; LARECOMP_DUMP_TEX=<w>x<h> dumps matching textures'
   raw bytes; ARK_F9_SPLIT_BLEND=2 splits passes without depth (the HUD) after each blended draw.
+
+## 2026-11-04: menus' frosted-glass backdrop black, then grey (fixed)
+
+How the game makes it: when the inventory opens, the tone-map pass (fs 8244adc000) lerps every pixel to the
+depth-of-field blur (cb3[113] focus range set so that all depths are out of focus), the result is copied into a
+1920x1080 RGBA8 capture (nvnCommandBufferCopyTextureToTexture, sRGB 0x38 -> UNORM 0x25), a full-screen copy draw
+(fs 8244915200) moves it into the texture the menu's HUD draws sample. Three bugs, one per stage:
+
+1. **Black:** the copy draw is one-shot. With asynchronous shader builds it was skipped (program not ready) and never
+   re-run. LARECOMP_SYNC_SHADERS=1 shows it; a skip policy that waits briefly is still to do.
+2. **Too dark:** NVN texture copies are raw texel copies; Ark blitted between the two formats, which decoded the sRGB.
+   Unscaled copies between colour formats of the same texel size now use vkCmdCopyImage (Vulkan allows
+   size-compatible formats). ARK_COPY_CONVERT=1 restores the blit.
+3. **Featureless grey gradient:** the DOF blur builds a pyramid (960x540 down to 7x4, blurred copies, then up-samples
+   from 30x16). Each up-sampling draw blends ONE + dst * SRC1_ALPHA: dual-source blending, keeping that level's own
+   blurred image. Ark only used dual-source when the pipeline had exactly one colour target, but NVN target sets are
+   8 wide with the rest unbound, so SRC1 was taken as zero and only the 30x16 level survived. Now: one *bound*
+   target (the others VK_FORMAT_UNDEFINED). This affects the in-game depth of field too. A "[vk] dual-source blend"
+   log line names any pipeline that still falls back.
+
+Debug tooling (ARK_LOG_BACKDROP=1): logs writes to 1920x1080 RGBA8 textures (first write, or after 30 idle frames);
+after frame 120 such a write traces the rest of that frame (every draw / dispatch / copy / non-bind command, every pass
+image as build/backdrop_NN.png, both ends of converting / raw copies); a journal of the previous and current frame's
+draws (targets, blend, sampled textures) is printed when the trace starts, and at the capture copy the inputs and GLSL
+of the last full-screen sRGB draws (build/backdrop_in*) and the frame's last 64 colour targets (build/backdrop_rt*)
+are saved.

@@ -689,6 +689,14 @@ static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static int debug_pass_no;
 
+// (ARK_LOG_BACKDROP, see backdrop_log below) when a capture-once full-screen texture is written, the rest of that frame
+// is traced: every draw and dispatch logged as in F9, every pass's target saved as build/backdrop_NN.png
+static uint64_t backdrop_trace_frame = ~0ull;
+static int backdrop_pass_no;
+static bool backdrop_tracing(void) { return renderer_present_count() == backdrop_trace_frame; }
+static void journal_dump(void);
+static void journal_save_inputs(void);
+static bool journal_inputs_pending;
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 static NvnTexture *shadow_pass_tex;  // (F9) the current pass draws into this shadow-cascade layer
@@ -710,6 +718,11 @@ static void vk_end_pass_at(int line) {
         if (multi && renderer_present_count() != debug_pass_frame) { debug_pass_frame = renderer_present_count(); debug_pass_no = 0; }
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
+        renderer_save_texture_tex(st.rt.color[0]->backend, path);
+    }
+    if (backdrop_tracing() && !g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && backdrop_pass_no < 200) {
+        char path[96];
+        snprintf(path, sizeof path, "build/backdrop_%02d.png", backdrop_pass_no++);
         renderer_save_texture_tex(st.rt.color[0]->backend, path);
     }
 }
@@ -736,6 +749,28 @@ static void xfb_begin_pass(void) {
     st.rt_dirty = true;  // the next ordinary draw begins its own pass
 }
 
+// ARK_LOG_BACKDROP=1: every pass / copy writing a 1920x1080 RGBA8 texture (format 0x25), capped: finds what writes a
+// menu's frosted-glass backdrop (the inventory's, black since 2026-11-03)
+// Logged: a texture's first write, and a write after 30 or more frames without one (a capture-once backdrop), not
+// the targets rendered every frame.
+static bool backdrop_log(const NvnTexture *t) {
+    static int on = -1, n;
+    static struct { const NvnTexture *t; uint64_t last; } seen[64];
+    if (on < 0) on = getenv("ARK_LOG_BACKDROP") && atoi(getenv("ARK_LOG_BACKDROP"));
+    if (!on || !t || t->format != 0x25 || t->width != 1920 || t->height != 1080 || n >= 400) return false;
+    uint64_t now = renderer_present_count();
+    int k = -1, oldest = 0;
+    for (int i = 0; i < 64; i++) {
+        if (seen[i].t == t) { k = i; break; }
+        if (seen[i].last < seen[oldest].last) oldest = i;
+    }
+    bool log = k < 0 || now - seen[k].last >= 30;
+    if (k < 0) k = oldest, seen[k].t = t;
+    seen[k].last = now;
+    if (log) n++;
+    return log;
+}
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty && !xfb_pass) return;
     vk_end_pass();
@@ -747,6 +782,22 @@ static void begin_pass(void) {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
                 (void *)st.rt.depth);
+    }
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (backdrop_log(st.rt.color[i])) {
+            LOG("[backdrop] frame %llu: pass renders into %p (target %d of %d, depth %p)\n", (unsigned long long)renderer_present_count(),
+                (void *)st.rt.color[i], i, st.rt.ncolor, (void *)st.rt.depth);
+            if (backdrop_trace_frame != renderer_present_count() && backdrop_pass_no < 200 && renderer_present_count() > 120) {
+                backdrop_trace_frame = renderer_present_count();
+                LOG("[backdrop] tracing the rest of frame %llu\n", (unsigned long long)backdrop_trace_frame);
+                journal_dump();
+                journal_inputs_pending = true;  // (saved at the capture copy, outside this pass setup)
+            }
+        }
+    if (backdrop_tracing() && st.rt.ncolor && st.rt.color[0]) {
+        NvnTexture *t0 = st.rt.color[0];
+        LOG("[backdrop] pass %d: %d targets, first %p %ux%u f%#x\n", backdrop_pass_no, st.rt.ncolor, (void *)t0, t0->width, t0->height,
+            t0->format);
     }
     if (g_gpuprof_frame) {
         NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
@@ -1570,9 +1621,23 @@ static void build_pipeline(void *arg) {
             memcpy(b, k->blend[i], sizeof b);
             if (is_src1(b[1]) || is_src1(b[2]) || is_src1(b[3]) || is_src1(b[4])) {
                 // dual-source: c1 is the second source where there is one target and the program writes c1
-                VkShaderModule dual = i == 0 && k->ncolor == 1 && g_vk.dual_src ? prog_fs_dual(k->prog) : VK_NULL_HANDLE;
+                // (NVN render-target sets are often 8 wide with only the first bound: the unbound ones are
+                // VK_FORMAT_UNDEFINED and do not count. The depth-of-field blur's up-sampling steps, whose
+                // ONE + SRC1_ALPHA blend kept each level's own blurred image: as zero, only the smallest level
+                // survived, and the menus' frosted glass was a featureless grey.)
+                bool one_target = true;
+                for (uint32_t j = 1; j < k->ncolor; j++) one_target &= k->color[j] == VK_FORMAT_UNDEFINED;
+                VkShaderModule dual = i == 0 && one_target && g_vk.dual_src ? prog_fs_dual(k->prog) : VK_NULL_HANDLE;
                 if (dual) stages[1].module = dual;
                 else for (int j = 1; j <= 4; j++) b[j] = src1_as_zero(b[j]);
+                static int nlog;
+                if (nlog < 24 && !dual) {
+                    nlog++;
+                    const char *src = k->prog && ((Prog *)k->prog)->fi ? ((Prog *)k->prog)->fi->msl : NULL;
+                    LOG("[vk] dual-source blend: fs out mask %#x, %d targets, device %d, c1 %s -> %s\n",
+                        k->prog && ((Prog *)k->prog)->fi ? ((Prog *)k->prog)->fi->out_mask : 0, k->ncolor, g_vk.dual_src,
+                        src && strstr(src, "layout(location = 1) out vec4 c1;") ? "declared" : "missing", dual ? "dual" : "SRC1 as zero");
+                }
             }
             cba[i].blendEnable = VK_TRUE;
             cba[i].srcColorBlendFactor = blend_factor(b[1]);
@@ -1637,6 +1702,103 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+}
+
+// (ARK_LOG_BACKDROP) a cheap journal of this frame's and the previous frame's draws, dispatches and copies (targets and
+// sampled textures), written out when a backdrop trace starts: what ran before the capture, untraced
+#define JN 6000
+static char (*journal[2])[160];
+static int njournal[2];
+static uint64_t journal_frame = ~0ull;
+static void journal_add(const char *fmt, ...) {
+    static int on = -1;
+    if (on < 0) on = getenv("ARK_LOG_BACKDROP") && atoi(getenv("ARK_LOG_BACKDROP"));
+    if (!on) return;
+    if (!journal[0]) { journal[0] = calloc(JN, 160); journal[1] = calloc(JN, 160); }
+    uint64_t now = renderer_present_count();
+    if (now != journal_frame) {
+        char (*t)[160] = journal[0]; journal[0] = journal[1]; journal[1] = t;  // [0] previous frame, [1] current
+        njournal[0] = journal_frame + 1 == now ? njournal[1] : 0;
+        njournal[1] = 0;
+        journal_frame = now;
+    }
+    if (njournal[1] >= JN) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(journal[1][njournal[1]++], 160, fmt, ap);
+    va_end(ap);
+}
+static void journal_dump(void) {
+    for (int f = 0; f < 2; f++) {
+        LOG("[journal] %s frame: %d entries\n", f ? "this" : "previous", njournal[f]);
+        for (int i = 0; i < njournal[f]; i++) LOG("[journal] %s\n", journal[f][i]);
+    }
+}
+static NvnTexture *jrt[64];
+static int njrt;
+static uint64_t jrt_frame = ~0ull;
+static void journal_rt(void) {
+    if (renderer_present_count() != jrt_frame) { jrt_frame = renderer_present_count(); njrt = 0; }
+    NvnTexture *t = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!t || t->width < 7) return;
+    for (int i = 0; i < njrt; i++) if (jrt[i] == t) return;
+    if (njrt == 64) { memmove(jrt, jrt + 1, 63 * sizeof *jrt); njrt--; }  // (keeps the frame's last 64)
+    jrt[njrt++] = t;
+}
+// the last few draws into a full-screen target (the tone-map writing the scene the capture copies): their program and
+// sampled textures, saved when the trace starts (still this frame, so the textures still hold what those draws read)
+static struct { Prog *pr; uint64_t vs, fs; NvnTexture *rt, *tex[8]; int ntex; } fsd[4];
+static int nfsd;
+void vk_save_prog_glsl(const void *prog, const char *prefix);
+static void journal_save_inputs(void) {
+    for (int i = 0; i < njrt; i++) {  // every colour target drawn this frame (first target), in first-draw order
+        NvnTexture *t = jrt[i];
+        if (!t->backend) continue;
+        char path[128];
+        snprintf(path, sizeof path, "build/backdrop_rt%02d_%ux%u_f%x.png", i, t->width, t->height, t->format);
+        LOG("[backdrop] rt %02d %p %ux%u f%#x\n", i, (void *)t, t->width, t->height, t->format);
+        renderer_save_texture_tex(t->backend, path);
+    }
+    for (int k = 0; k < nfsd && k < 4; k++) {
+        int i = (nfsd - 1 - k) & 3;
+        char path[128];
+        snprintf(path, sizeof path, "build/backdrop_in%d_%llx_%llx", k, (unsigned long long)fsd[i].vs, (unsigned long long)fsd[i].fs);
+        vk_save_prog_glsl(fsd[i].pr, path);
+        LOG("[backdrop] input set %d: fs %llx -> %p, GLSL %s_*.glsl\n", k, (unsigned long long)fsd[i].fs, (void *)fsd[i].rt, path);
+        for (int j = 0; j < fsd[i].ntex; j++) {
+            NvnTexture *t = fsd[i].tex[j];
+            if (!t || !t->backend) continue;
+            snprintf(path, sizeof path, "build/backdrop_in%d_t%d_%ux%u_f%x.png", k, j, t->width, t->height, t->format);
+            LOG("[backdrop]   t%d %p %ux%u f%#x\n", j, (void *)t, t->width, t->height, t->format);
+            renderer_save_texture_tex(t->backend, path);
+        }
+    }
+}
+static void journal_draw(Prog *pr) {
+    if (getenv("ARK_LOG_BACKDROP")) journal_rt();
+    if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->width == 1920 && st.rt.color[0]->height == 1080 && st.rt.color[0]->format == 0x38 &&
+        getenv("ARK_LOG_BACKDROP")) {
+        int i = nfsd++ & 3;
+        fsd[i].pr = pr; fsd[i].rt = st.rt.color[0];
+        fsd[i].vs = st.program->stages[0].code_addr; fsd[i].fs = st.program->stage_mask & 2 ? st.program->stages[1].code_addr : 0;
+        fsd[i].ntex = 0;
+        for (int j = 0; j < pr->fi->ntex && fsd[i].ntex < 8; j++) fsd[i].tex[fsd[i].ntex++] = shader_texture_object(1, &pr->fi->tex[j]);
+    }
+    char b[160];
+    int n = snprintf(b, sizeof b, "draw fs=%llx rt", (unsigned long long)(st.program->stage_mask & 2 ? st.program->stages[1].code_addr : 0));
+    for (int i = 0; i < st.rt.ncolor && n < 100; i++)
+        if (st.rt.color[i]) n += snprintf(b + n, sizeof b - n, " %p %ux%u/%#x", (void *)st.rt.color[i], st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    if (st.color_state[0] & 1) {
+        const uint8_t *bs = st.blend[0];
+        n += snprintf(b + n, sizeof b - n, " [blend %02x%02x%02x%02x%02x%02x%02x bc %.2g %.2g]", bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7],
+                      st.blend_color[0], st.blend_color[3]);
+    }
+    n += snprintf(b + n, sizeof b - n, " <-");
+    for (int i = 0; i < pr->fi->ntex && n < 150; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (t) n += snprintf(b + n, sizeof b - n, " %p %ux%u", (void *)t, t->width, t->height);
+    }
+    journal_add("%s", b);
 }
 
 // (F9, LARECOMP_DUMP_TEX) GPU image read-backs, written once their submission has completed (vk_debug_readbacks)
@@ -2415,11 +2577,12 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp || atomic_load(&cp->p.state) != 1) {
-        if (g_debug_frame) debug_dispatch(cp, gx, gy, gz, !cp ? "SKIPPED (no program)" : atomic_load(&cp->p.state) == 2 ? "SKIPPED (failed)" : "SKIPPED (building)");
+        if (g_debug_frame || backdrop_tracing()) debug_dispatch(cp, gx, gy, gz, !cp ? "SKIPPED (no program)" : atomic_load(&cp->p.state) == 2 ? "SKIPPED (failed)" : "SKIPPED (building)");
         stat_skipped++;
         return;
     }
-    if (g_debug_frame) debug_dispatch(cp, gx, gy, gz, "run");
+    if (g_debug_frame || backdrop_tracing()) debug_dispatch(cp, gx, gy, gz, "run");
+    journal_add("dispatch cs=%llx %ux%ux%u", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz);
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
@@ -2605,7 +2768,9 @@ static void draw_(CmdRec *r, bool indexed) {
         extern void widescreen_scene_ubo(const float *u, uint64_t size);  // (the camera's view-projection)
         if (st.ubuf[0][5].addr) widescreen_scene_ubo((const float *)(uintptr_t)st.ubuf[0][5].addr, st.ubuf[0][5].size);
     }
-    if (g_debug_frame) debug_draw(pr, r, indexed);
+    bool was_tracing = backdrop_tracing();
+    journal_draw(pr);
+    if (g_debug_frame || was_tracing) debug_draw(pr, r, indexed);
     if (xfb_draw) {
         xfb_begin_pass();
     } else {
@@ -2616,6 +2781,8 @@ static void draw_(CmdRec *r, bool indexed) {
         for (int i = 0; i < st.rt.ncolor; i++)
             if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
         begin_pass();
+        // (ARK_LOG_BACKDROP) the draw whose pass started the trace: logged here, as it was past debug_draw then
+        if (!was_tracing && backdrop_tracing() && !g_debug_frame) { LOG("[backdrop] the draw that started the trace:\n"); debug_draw(pr, r, indexed); }
     }
     VkCommandBuffer cb = vk_cmd();
 
@@ -3232,6 +3399,8 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     if (!t || !src) return;
+    if (backdrop_log(t) || backdrop_tracing())
+        LOG("[backdrop] frame %llu: buffer %llx -> %p\n", (unsigned long long)renderer_present_count(), (unsigned long long)src, (void *)t);
     vk_end_pass();
     const FormatInfo *fi;
     int32_t rg[6];
@@ -3330,6 +3499,12 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
+    if (journal_inputs_pending) { journal_inputs_pending = false; vk_end_pass(); journal_save_inputs(); }
+    journal_add("copy %p %ux%u/%#x -> %p %ux%u/%#x flags %llx", (void *)st_, st_->width, st_->height, st_->format, (void *)dt, dt->width,
+                dt->height, dt->format, (unsigned long long)flags);
+    if (backdrop_log(dt) || backdrop_tracing())
+        LOG("[backdrop] frame %llu: copy %p %ux%u f%#x -> %p (flags %#llx)\n", (unsigned long long)renderer_present_count(),
+            (void *)st_, st_->width, st_->height, st_->format, (void *)dt, (unsigned long long)flags);
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
     gp_mark(vk_cmd(), "copy texture %ux%u -> %ux%u", st_->width, st_->height, dt->width, dt->height);
@@ -3368,7 +3543,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         if (dy0 + dh > dlh) dh = dlh - dy0;
         if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
     }
-    if (g_debug_frame)
+    if (g_debug_frame || backdrop_tracing())
         LOG("[copytex] %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] -> %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] phys (%d,%d %dx%d) -> (%d,%d %dx%d) flags %llx\n",
             (void *)st_, st_->width, st_->height, st_->format, slv, sr[0], sr[1], sr[3], sr[4], s->width, s->height, (void *)dt, dt->width,
             dt->height, dt->format, dlv, dr[0], dr[1], dr[3], dr[4], d->width, d->height, sx0, sy0, sw, sh, dx0, dy0, dw, dh,
@@ -3383,11 +3558,24 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         return;
     }
     if (s->samples != d->samples) return;
-    if (sw == dw && sh == dh && s->format == d->format) {
+    // NVN copies are raw texel copies: an unscaled copy between two colour formats of the same texel size (sRGB RGBA8 ->
+    // UNORM RGBA8: the menus' frosted-glass capture) copies the bits too. A blit converted it (sRGB decode), darkening
+    // the capture. Vulkan allows vkCmdCopyImage between size-compatible formats.
+    const FormatInfo *sfi = st_->layout.fmt, *dfi = dt->layout.fmt;
+    bool raw = s->format != d->format && sfi && dfi && sfi->bpb && sfi->bpb == dfi->bpb && sfi->bw == dfi->bw && sfi->bh == dfi->bh &&
+               !((sa | da) & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && !getenv("ARK_COPY_CONVERT");
+    if (sw == dw && sh == dh && (s->format == d->format || raw)) {
         VkImageCopy c = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
                          .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
         vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         debug_copy_depth(s, d);
+        if (raw && backdrop_tracing()) {
+            static int nr;
+            char path[96];
+            vk_full_barrier(cb);
+            snprintf(path, sizeof path, "build/backdrop_raw%02d_dst.png", nr++);
+            renderer_save_texture_tex(d, path);
+        }
         return;
     }
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked
@@ -3402,6 +3590,15 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             s->height, sx0, sy0, sw, sh, (void *)d->image, dlv, d->levels, d->width, d->height, dx0, dy0, dw, dh, linear ? "linear" : "nearest");
     vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     debug_copy_depth(s, d);
+    if (backdrop_tracing() && !depth) {  // (ARK_LOG_BACKDROP) both ends of each converting copy in the traced frame
+        static int nc;
+        char path[96];
+        vk_full_barrier(cb);
+        snprintf(path, sizeof path, "build/backdrop_copy%02d_src.png", nc);
+        renderer_save_texture_tex(s, path);
+        snprintf(path, sizeof path, "build/backdrop_copy%02d_dst.png", nc++);
+        renderer_save_texture_tex(d, path);
+    }
 }
 
 // ================================================================== present helpers (device.c)
@@ -3731,6 +3928,10 @@ static void exec_list(uint64_t handle, int depth) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        // (ARK_LOG_BACKDROP) during the traced frame: every command that is not a state bind, draw or dispatch
+        if (backdrop_tracing() && r->op >= CMD_CLEAR_COLOR && !(r->op >= CMD_DRAW_ARRAYS && r->op <= CMD_DISPATCH_INDIRECT))
+            LOG("[backdrop]   command %d (x %llx %llx %llx)\n", r->op, (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                (unsigned long long)r->x[2]);
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
