@@ -43,6 +43,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, aniso, dual_src;
+    bool gmem_uab;             // global memory chunks in an update-after-bind set (higher descriptor limits: MoltenVK)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

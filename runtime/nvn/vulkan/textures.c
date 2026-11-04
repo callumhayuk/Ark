@@ -766,6 +766,13 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         if (c[0] || c[1] || c[2] || c[3]) {  // never set: identity
             if (fmt_of(t->format).alpha_one)
                 for (int i = 0; i < 4; i++) if (c[i] == 5) c[i] = 1;
+            // Ark (experiment, ARK_SWIZZLE_ONE_TO_A=1): for BC4 / BC5, whose alpha reads exactly 1, a ONE in the swizzle
+            // written as A. Tried against the area-name banner's opaque box (2026-11-04): the box stayed, so it is off.
+            static int one_to_a = -1;
+            if (one_to_a < 0) one_to_a = getenv("ARK_SWIZZLE_ONE_TO_A") && atoi(getenv("ARK_SWIZZLE_ONE_TO_A"));
+            if (one_to_a && (fmt == VK_FORMAT_BC4_UNORM_BLOCK || fmt == VK_FORMAT_BC4_SNORM_BLOCK ||
+                              fmt == VK_FORMAT_BC5_UNORM_BLOCK || fmt == VK_FORMAT_BC5_SNORM_BLOCK))
+                for (int i = 0; i < 4; i++) if (c[i] == 1) c[i] = 5;
             // NVN swizzle 0 zero, 1 one, 2..5 r,g,b,a == VkComponentSwizzle - 1
             sw = (VkComponentMapping){(VkComponentSwizzle)(c[0] + 1), (VkComponentSwizzle)(c[1] + 1), (VkComponentSwizzle)(c[2] + 1),
                                       (VkComponentSwizzle)(c[3] + 1)};

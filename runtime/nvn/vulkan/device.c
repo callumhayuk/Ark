@@ -184,6 +184,7 @@ static void create_device(void) {
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
                                             .scalarBlockLayout = VK_TRUE, .shaderStorageBufferArrayNonUniformIndexing = VK_TRUE,
+                                            .descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE,
                                             .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                             .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
@@ -204,6 +205,8 @@ static void create_device(void) {
         ARK_FEAT(f12.scalarBlockLayout, h12.scalarBlockLayout, "scalarBlockLayout")
         ARK_FEAT(f12.shaderStorageBufferArrayNonUniformIndexing, h12.shaderStorageBufferArrayNonUniformIndexing,
                  "shaderStorageBufferArrayNonUniformIndexing")
+        ARK_FEAT(f12.descriptorBindingStorageBufferUpdateAfterBind, h12.descriptorBindingStorageBufferUpdateAfterBind,
+                 "descriptorBindingStorageBufferUpdateAfterBind")
         ARK_FEAT(f13.dynamicRendering, h13.dynamicRendering, "dynamicRendering")
         ARK_FEAT(f13.synchronization2, h13.synchronization2, "synchronization2")
         ARK_FEAT(f13.shaderDemoteToHelperInvocation, h13.shaderDemoteToHelperInvocation, "shaderDemoteToHelperInvocation")
@@ -211,6 +214,7 @@ static void create_device(void) {
         ARK_FEAT(f13.maintenance4, h13.maintenance4, "maintenance4")
 #undef ARK_FEAT
     }
+    g_vk.gmem_uab = f12.descriptorBindingStorageBufferUpdateAfterBind;  // (exec.c global_layouts; decided below)
     void *chain = &f11;
 #if defined(VK_KHR_portability_subset)
     VkPhysicalDevicePortabilitySubsetFeaturesKHR ps = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
@@ -261,7 +265,15 @@ static void create_device(void) {
 
     {   // Ark: shader global memory is imported in chunks the device can bind as one storage buffer each
         // (exec.c gmem_update; maxwell/shader.h GMEM_SET): the largest power of two within its limits, up to 64 MB
-        VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};
+        // The chunks are one descriptor array, so their number is capped by the per-stage storage buffer limit: 31 on
+        // MoltenVK. Laid out linearly that reached under 2 GB of Legends: Arceus's 8 GB of mappings (the rain's GPU
+        // simulation read its emitter from beyond and got zeros: the rain stood still, 2026-11-03). Chunks are now
+        // found through a table (maxwell_gmem_table, exec.c slot_assign): the slots go to the chunks that hold NVN
+        // memory pools, wherever they are. ARK_GMEM_UAB=1: an update-after-bind set with its higher limits instead (128
+        // slots; on MoltenVK it cost up to half the frame rate in the rain).
+        VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+                                                     .pNext = &p12};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m3};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         uint64_t lim = p2.properties.limits.maxStorageBufferRange;
@@ -272,10 +284,22 @@ static void create_device(void) {
         maxwell_gmem_chunk_log2 = lg;
         int nch = (int)((8ull << 30) >> lg);  // (8 GB of arenas; Legends: Arceus maps about 4.5)
         uint32_t maxsb = p2.properties.limits.maxPerStageDescriptorStorageBuffers;
+        uint32_t uab = p12.maxPerStageDescriptorUpdateAfterBindStorageBuffers;
+        if (p12.maxDescriptorSetUpdateAfterBindStorageBuffers < uab) uab = p12.maxDescriptorSetUpdateAfterBindStorageBuffers;
+        if (p12.maxPerStageUpdateAfterBindResources < uab) uab = p12.maxPerStageUpdateAfterBindResources;
+        uab = uab > 16 ? uab - 16 : 0;  // (room for the programs' own storage buffers, which count towards it too)
+        if (!getenv("ARK_GMEM_UAB") || !atoi(getenv("ARK_GMEM_UAB"))) g_vk.gmem_uab = false;  // (opt in: see above)
+        extern int maxwell_gmem_table;
+        maxwell_gmem_table = 1;
+        if (g_vk.gmem_uab && uab > maxsb) maxsb = uab;
+        else g_vk.gmem_uab = false;
         if (nch > 128) nch = 128;
         if ((uint32_t)nch > maxsb) nch = (int)maxsb;
         maxwell_gmem_chunks = nch;
-        LOG("[vk] shader global memory: %d chunks of %llu MB\n", nch, (unsigned long long)(1ull << (lg - 20)));
+        LOG("[vk] shader global memory: %d chunks of %llu MB (%s set; storage buffer limits %u, update-after-bind %u)\n",
+            nch, (unsigned long long)(1ull << (lg - 20)), g_vk.gmem_uab ? "update-after-bind" : "plain",
+            p2.properties.limits.maxPerStageDescriptorStorageBuffers, p12.maxPerStageDescriptorUpdateAfterBindStorageBuffers);
+        // (exec.c logs each chunk's slot, and a warning if more chunks hold pools than there are slots)
     }
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
@@ -555,6 +579,8 @@ void backend_represent(void) {
 }
 
 void backend_present(NvnTexture *t) {
+    extern void vk_debug_readbacks(void);
+    vk_debug_readbacks();  // (F9 + LARECOMP_DUMP_TEX: GPU images read back, once their submission is done)
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
@@ -634,7 +660,19 @@ void backend_present(NvnTexture *t) {
     {   // LARECOMP_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log)
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);
-        if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
+        extern void vk_gpuprof_summary(uint64_t frame, double frame_ms);
+        extern volatile int g_gpuprof_request;
+        static int gp_left;  // Shift+F9 (hle/input.c): frames still to profile, one summary line each
+        static uint64_t gp_last_ns;
+        uint64_t gp_now = SDL_GetTicksNS();
+        if (g_gpuprof_frame) {
+            g_gpuprof_frame = false;
+            if (gp_left > 0) vk_gpuprof_summary(total_frames, gp_last_ns ? (gp_now - gp_last_ns) / 1e6 : 0);
+            else vk_gpuprof_report();
+        }
+        gp_last_ns = gp_now;
+        if (g_gpuprof_request) { gp_left = g_gpuprof_request; g_gpuprof_request = 0; LOG("[gpuprof] next %d frames:\n", gp_left); }
+        if (gp_left > 0) { g_gpuprof_frame = true; gp_left--; }
         const char *e = getenv("LARECOMP_GPUPROF_AT");
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);
@@ -749,6 +787,14 @@ void ui_window_init(void) {
 }
 
 SDL_Window *ui_window(void) { return window; }
+
+// The overlay menu's view of the device (runtime/ui/menu.cpp: Dear ImGui's Vulkan backend draws into the window image
+// with dynamic rendering, on this queue from the render thread)
+void vk_menu_device(VkInstance *inst, VkPhysicalDevice *phys, VkDevice *dev, uint32_t *qfam, VkQueue *queue,
+                    VkPipelineCache *pcache, VkFormat *format, uint32_t *images) {
+    *inst = g_vk.inst, *phys = g_vk.phys, *dev = g_vk.dev, *qfam = g_vk.qfam, *queue = g_vk.queue;
+    *pcache = g_vk.pcache, *format = g_vk.sc_format, *images = g_vk.sc_count;
+}
 
 void backend_init(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);

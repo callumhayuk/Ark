@@ -16,11 +16,15 @@ Settings g_settings = {
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
+    .show_fps = true,  // (frame rate counter, top left: runtime/ui/menu.cpp)
+    .shiny_rolls = 1,
+    .alpha_rolls = 1,
 };
 
 #define INI "ark.ini"
 
 static bool parse_bool(const char *v) { return !strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "on"); }
+static int clamp_rolls(int n, int max) { return n < 0 ? 0 : n > max ? max : n; }
 
 void settings_load(void) {
     FILE *f = fopen(INI, "r");
@@ -44,6 +48,8 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = parse_bool(val);
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = parse_bool(val);
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = parse_bool(val);
+        else if (!strcmp(key, "shiny_rolls")) g_settings.shiny_rolls = clamp_rolls(atoi(val), 500);
+        else if (!strcmp(key, "alpha_rolls")) g_settings.alpha_rolls = clamp_rolls(atoi(val), 100);
     }
     fclose(f);
 }
@@ -61,5 +67,7 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "shiny_rolls = %d\n", g_settings.shiny_rolls);
+    fprintf(f, "alpha_rolls = %d\n", g_settings.alpha_rolls);
     fclose(f);
 }

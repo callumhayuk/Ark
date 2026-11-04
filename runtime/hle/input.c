@@ -149,7 +149,11 @@ void input_handle_event(const SDL_Event *e) {
     if (hotkeys_handle(e)) return;  // F2..F6: run-time switches (runtime/hotkeys.c)
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
-        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) {
+            extern volatile int g_gpuprof_request;  // Shift+F9: GPU time of the next 90 frames, one line each
+            if (e->key.mod & SDL_KMOD_SHIFT) g_gpuprof_request = 90;
+            else g_debug_frame_request = 1;
+        }
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat) {
             extern void timescan_request(void);  // (debug: find values that step by a fixed amount per frame)
             timescan_request();
@@ -370,7 +374,7 @@ void input_frame(uint64_t frame) {
     script_ry = ry;
 }
 
-extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+extern bool menu_input_captured(void);  // runtime/ui/menu.cpp: overlay menu open (it has the keys / pad)
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
 uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }

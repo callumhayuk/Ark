@@ -144,6 +144,11 @@ void ark_terrain_range(Cpu *c) {
     c->v[5] = w;
 }
 float ark_terrain_factor(void) { terrain_factor_init(); return terrain_factor; }
+void ark_terrain_set(float f) {  // (the overlay menu: runtime/ui/menu.cpp)
+    terrain_factor_init();
+    terrain_factor = f < 0.25f ? 0.25f : f > 16 ? 16 : f;
+    LOG("[switch] terrain detail range x%g (%g m)\n", terrain_factor, 40 * terrain_factor);
+}
 
 // ---- run-time switches (runtime/hotkeys.c: F2..F5 in the game window; the title bar shows them)
 static int table2_half;
@@ -208,9 +213,100 @@ int ark_speed(void) {
     }
     return speed;
 }
-void ark_speed_cycle(void) {
-    int s = ark_speed();
-    speed = s == 1 ? 2 : s == 2 ? 4 : s == 4 ? 0 : 1;
+void ark_speed_set(int s) {  // (F8 below; the overlay menu: runtime/ui/menu.cpp)
+    ark_speed();
+    speed = s < 0 ? 1 : s > 16 ? 16 : s;
     if (speed) LOG("[speed] game speed x%d\n", speed);
     else LOG("[speed] game speed: unlimited\n");
+}
+void ark_speed_cycle(void) {
+    int s = ark_speed();
+    ark_speed_set(s == 1 ? 2 : s == 2 ? 4 : s == 4 ? 0 : 1);
+}
+
+// ---- shiny and alpha rates (the overlay menu's Gameplay sliders, runtime/ui/menu.cpp; ark.ini shiny_rolls and
+// alpha_rolls; shiny 0..500, alpha 0..100, default 1). Both act on Pokémon generated after a change; ones already spawned keep theirs.
+#include "settings.h"
+
+static int rate_mult(const int *v, int max) {
+    int m = __atomic_load_n(v, __ATOMIC_RELAXED);
+    return m < 0 ? 0 : m > max ? max : m;
+}
+
+// Shiny (tools/lifter/patches.py shiny_mode, shiny_rolls): pml's Pokémon creation (main+0x2B8BAC0) draws up to
+// [spec+57] PIDs in PID mode 0x3_FFFFFFFF and keeps the first shiny one, 1 in 4096 a draw. That count is the game's
+// rolls (1, more with the Shiny Charm, a complete research entry and outbreaks); it is multiplied here. At 0 the mode
+// becomes 0x1_FFFFFFFF, the game's own "random, never shiny".
+static uint32_t shiny_last_rolls;  // the game's count for the last Pokémon made in that mode
+uint32_t ark_shiny_rolls(uint32_t rolls) {
+    if (rolls) __atomic_store_n(&shiny_last_rolls, rolls, __ATOMIC_RELAXED);
+    int m = rate_mult(&g_settings.shiny_rolls, 500);
+    return rolls * (uint32_t)(m ? m : 1);
+}
+uint64_t ark_shiny_mode(uint64_t mode) {
+    return mode == 0x3ffffffffull && rate_mult(&g_settings.shiny_rolls, 500) == 0 ? 0x1ffffffffull : mode;
+}
+uint32_t ark_shiny_last_rolls(void) { return __atomic_load_n(&shiny_last_rolls, __ATOMIC_RELAXED); }
+
+// Alpha (tools/lifter/patches.py alpha_pick): the spawner (main+0xF94470) picks a slot of its encounter table with
+// main+0xF95DA0(slots, time, weather, mode, alpha_only, rng): a weighted random pick among the slots allowed now. A
+// slot is an alpha one when either bool of its field 46 (a table) is set; the spawner then makes it an alpha (3 perfect
+// IVs, size 255). Alpha spawn points ask for alpha_only and always give one. Otherwise the pick is repeated up to
+// N times until it lands on an alpha slot (an area whose alpha slots hold share p of the weight: 1 - (1 - p)^N);
+// at 0 it is repeated (up to 32 times) until it doesn't.
+static int slot_is_alpha(uint64_t t) {
+    if (!t) return 0;
+    uint64_t vt = t - (int64_t)(int32_t)LD32(t);
+    if (LD16(vt) < 0x62 || !LD16(vt + 96)) return 0;
+    uint64_t f = t + LD16(vt + 96), sub = f + LD32(f);
+    uint64_t svt = sub - (int64_t)(int32_t)LD32(sub);
+    uint16_t n = LD16(svt);
+    if (n >= 6 && LD16(svt + 4) && LD8(sub + LD16(svt + 4))) return 1;
+    if (n >= 8 && LD16(svt + 6) && LD8(sub + LD16(svt + 6))) return 1;
+    return 0;
+}
+
+static float alpha_last_share = -1;  // alpha slots' share of the last ordinary spawn table's weight (-1: none yet)
+float ark_alpha_last_share(void) {
+    float v;
+    __atomic_load(&alpha_last_share, &v, __ATOMIC_RELAXED);
+    return v;
+}
+
+void ark_alpha_pick(Cpu *c, void (*pick)(Cpu *)) {
+    uint64_t in[6], lr = c->x[30], sp = c->sp;
+    memcpy(in, c->x, sizeof in);
+    pick(c);
+    if ((uint32_t)in[4]) return;  // an alpha spawn point
+    // The pick's eligible slots and their weights are still in its stack frame: 64 (slot, float weight) pairs of
+    // 16 bytes at its sp + 8 (sp = ours - 144 - 0x410), cleared on entry, filled from the front.
+    uint64_t tab = sp - 144 - 0x410 + 8;
+    double total = 0, alpha = 0;
+    for (int i = 0; i < 64; i++) {
+        uint64_t t = LD64(tab + 16 * i);
+        if (!t) break;
+        uint32_t bits = LD32(tab + 16 * i + 8);
+        float w;
+        memcpy(&w, &bits, 4);
+        if (!(w > 0)) continue;
+        total += w;
+        if (slot_is_alpha(t)) alpha += w;
+    }
+    if ((uint32_t)in[3] == 0 && total > 0) {
+        float share = (float)(alpha / total);
+        __atomic_store(&alpha_last_share, &share, __ATOMIC_RELAXED);
+    }
+    int m = rate_mult(&g_settings.alpha_rolls, 100);
+    if (m == 1 || !c->x[0] || alpha <= 0 || (m == 0 && alpha >= total)) return;
+    int want = m > 1, tries = want ? m - 1 : 32;
+    uint64_t got = c->x[0];
+    while (tries-- > 0 && slot_is_alpha(got) != want) {
+        memcpy(c->x, in, sizeof in);
+        c->x[30] = lr;
+        c->sp = sp;
+        pick(c);
+        if (!c->x[0]) break;
+        got = c->x[0];
+    }
+    c->x[0] = got;
 }

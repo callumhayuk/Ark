@@ -43,6 +43,12 @@ Ark's own files in `runtime/`: `main.c` (based on LAS's), `stubs.c`, `rando.h`, 
 `third_party/smaa/` (SMAA.hlsl and its lookup textures) by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando
 Navarro and Diego Gutierrez, as vendored by LAS Recomp; license in `third_party/smaa/LICENSE.txt`.
 
+## Dear ImGui (MIT)
+
+Source: https://github.com/ocornut/imgui, tag v1.91.9 (commit 97428e8ac99e339ce05eee531cf55b77b29ea709).
+`third_party/imgui/`: the core (`imgui*.cpp`, `imgui*.h`, `imstb_*.h`, `imconfig.h`) and `backends/imgui_impl_vulkan.*`,
+unchanged. Used by the overlay menu (`runtime/ui/menu.cpp`); the platform side (SDL events) is Ark's own, in that file.
+
 ## Built from source by `tools/deps/build_linux_deps.sh` (not in this repository)
 
 Vulkan-Headers and Vulkan-Loader (Apache-2.0), Vulkan Memory Allocator (MIT), shaderc / glslang / SPIRV-Tools

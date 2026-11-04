@@ -62,8 +62,12 @@ RTDEFS   := -DARK_HEADLESS -Iruntime/headless $(if $(DEPS),-I$(DEPS)/include)
 LDLIBS   := $(if $(DEPS),-L$(DEPS)/lib) -lopus -lpthread -lm -ldl
 else
 RT_SRC   += $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) $(wildcard runtime/nvn/vulkan/*.c)
-RT_CXX   := $(wildcard runtime/nvn/vulkan/*.cpp)
-RTDEFS   := $(if $(DEPS),-I$(DEPS)/include) -Iruntime/nvn -I$(B)/inc -Ithird_party/smaa/Textures
+RT_CXX   := $(wildcard runtime/nvn/vulkan/*.cpp) $(wildcard runtime/ui/*.cpp)
+# Dear ImGui (the overlay menu, runtime/ui/menu.cpp): core + Vulkan backend
+IMGUI_SRC := $(addprefix third_party/imgui/,imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp imgui_demo.cpp \
+             backends/imgui_impl_vulkan.cpp)
+IMGUI_OBJ := $(patsubst third_party/%.cpp,$(B)/tp/%.o,$(IMGUI_SRC))
+RTDEFS   := $(if $(DEPS),-I$(DEPS)/include) -Iruntime/nvn -I$(B)/inc -Ithird_party/smaa/Textures -Ithird_party/imgui
 ifeq ($(OS),Windows_NT)
 LDLIBS   := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lvulkan-1 -lshaderc_shared -lopus \
             -lstdc++ -lwinmm -lole32 -lshell32 -lcomdlg32 -luser32 -luuid -lpthread
@@ -77,10 +81,10 @@ endif
 # extra compiler flags for the runtime, e.g. ARK_CFLAGS=-I<folder with vma/vk_mem_alloc.h> (header-only, not in Homebrew)
 ARK_CFLAGS ?=
 RTDEFS   += $(ARK_CFLAGS)
-RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)) $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(RT_CXX))
+RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)) $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(RT_CXX)) $(IMGUI_OBJ)
 RTFLAGS  := -O1 -g -std=gnu11 $(MFLAGS) $(OSFLAGS) -fno-strict-aliasing -Iruntime/include -Iruntime $(RTDEFS) \
             -Wall -Wno-unused-function -Wno-format
-RT_HDRS  := $(wildcard runtime/*.h runtime/nvn/*.h runtime/nvn/*/*.h) runtime/include/cpu.h
+RT_HDRS  := $(wildcard runtime/*.h runtime/nvn/*.h runtime/nvn/*/*.h runtime/ui/*.h) runtime/include/cpu.h
 
 .PHONY: help gen objs rt ark mkromfs launcher test-lift clean
 help:
@@ -106,6 +110,10 @@ $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 $(B)/rt/%.o: runtime/%.cpp $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) -O2 -g -std=c++17 $(MFLAGS) $(OSFLAGS) $(RTDEFS) -Iruntime -c $< -o $@
+
+$(B)/tp/%.o: third_party/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -O2 -g -std=c++17 $(MFLAGS) $(OSFLAGS) $(RTDEFS) -c $< -o $@
 
 # SMAA's reference shader source as a C string (runtime/nvn/smaa_data.c)
 $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl

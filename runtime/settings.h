@@ -23,6 +23,8 @@ typedef struct {
     bool reverb;         // the audio renderer's reverb effect
     bool movie_audio;
     bool show_fps;
+    int shiny_rolls;     // shiny roll multiplier, 0..500 (0: no random shinies; runtime/patches.c ark_shiny_rolls)
+    int alpha_rolls;     // alpha slot picks, 0..100 (0: avoid alpha slots; runtime/patches.c ark_alpha_pick)
 } Settings;
 
 extern Settings g_settings;

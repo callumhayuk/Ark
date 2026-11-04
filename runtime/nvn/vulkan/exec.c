@@ -45,6 +45,8 @@ typedef struct {
     uint64_t seq;
     VkDescriptorPool pools[16];
     int npools, cur_pool;
+    VkDescriptorPool gpools[4];  // update-after-bind pools for the global memory set (device.c g_vk.gmem_uab)
+    int ngpools, cur_gpool;
 } Sub;
 static Sub subs[SUBS];
 static int cur_sub;
@@ -89,7 +91,8 @@ static Sub *sub(void) {
             s->ts = false;
         }
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
-        s->cur_pool = 0;
+        for (int i = 0; i < s->ngpools; i++) vkResetDescriptorPool(g_vk.dev, s->gpools[i], 0);
+        s->cur_pool = s->cur_gpool = 0;
         s->seq = submit_seq + 1;
         s->main_begun = s->upload_begun = false;
     }
@@ -181,6 +184,33 @@ static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     gp_n++;
 }
 void renderer_flush(void);
+volatile int g_gpuprof_request;  // (hle/input.c Shift+F9; device.c)
+
+// One line per profiled frame (Shift+F9): GPU time first to last mark, the frame's wall time, the three costliest rows
+void vk_gpuprof_summary(uint64_t frame, double frame_ms) {
+    if (!gp_n) return;
+    renderer_flush();
+    uint64_t t[512];
+    if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+        double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
+        int top[3] = {-1, -1, -1};
+        for (int i = 0; i + 1 < gp_n; i++) {
+            double ms = (t[i + 1] - t[i]) * per;
+            for (int k = 0; k < 3; k++) {
+                if (top[k] >= 0 && ms <= (t[top[k] + 1] - t[top[k]]) * per) continue;
+                for (int j = 2; j > k; j--) top[j] = top[j - 1];
+                top[k] = i;
+                break;
+            }
+        }
+        LOG("[gpuprof] frame %llu: gpu %.1f ms (%d marks), frame %.1f ms | top:", (unsigned long long)frame, total, gp_n, frame_ms);
+        for (int k = 0; k < 3; k++)
+            if (top[k] >= 0) LOG(" %.1f ms %.60s%s", (t[top[k] + 1] - t[top[k]]) * per, gp_label[top[k]], k < 2 ? ";" : "");
+        LOG("\n");
+    }
+    gp_n = 0;
+}
+
 void vk_gpuprof_report(void) {
     if (!gp_n) return;
     renderer_flush();
@@ -288,6 +318,29 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, &set);
         if (r == VK_SUCCESS) return set;
         s->cur_pool++;
+    }
+}
+
+// The global memory set (gmem_set) when it is update-after-bind: from pools of its own carrying that flag, so the
+// other sets stay in plain pools.
+#define GMEM_POOL_CHUNKS 128  // (= MAX_GCHUNKS, defined further down)
+static VkDescriptorSet vk_alloc_gmem_set(VkDescriptorSetLayout layout) {
+    Sub *s = sub();
+    for (;;) {
+        if (s->cur_gpool == s->ngpools) {
+            if (s->ngpools == 4) FATAL("global memory descriptor pools exhausted\n");
+            VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * GMEM_POOL_CHUNKS},
+                                            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64}};
+            VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 64,
+                                             .poolSizeCount = 2, .pPoolSizes = sizes,
+                                             .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT};
+            VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->gpools[s->ngpools++]));
+        }
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                          .descriptorPool = s->gpools[s->cur_gpool], .descriptorSetCount = 1, .pSetLayouts = &layout};
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(g_vk.dev, &ai, &set) == VK_SUCCESS) return set;
+        s->cur_gpool++;
     }
 }
 
@@ -512,6 +565,7 @@ static struct {
     int32_t scissor[16][4];
     float depth_range[16][2];
     float blend_color[4];
+    float alpha_ref;  // nvnCommandBufferSetAlphaRef (the alpha test: color_state[2] = function)
     uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
     bool prim_restart;
     uint32_t restart_index;
@@ -1011,7 +1065,13 @@ static void global_layouts(void) {
         VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)maxwell_gmem_chunks, VK_SHADER_STAGE_ALL, NULL},
                                               {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL}};
         VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = lb};
+        // (device.c: an update-after-bind set when that lifts the chunk limit; its pools carry the matching flag)
+        VkDescriptorBindingFlags bf[2] = {VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, 0};
+        VkDescriptorSetLayoutBindingFlagsCreateInfo bfi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+                                                           .bindingCount = 2, .pBindingFlags = bf};
+        if (g_vk.gmem_uab) ci.pNext = &bfi, ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &ci, NULL, &g_gmem_layout));
+        ci.pNext = NULL, ci.flags = 0;
         ci.bindingCount = 0;
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &ci, NULL, &g_empty_layout));
     }
@@ -1579,6 +1639,60 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
 }
 
+// (F9, LARECOMP_DUMP_TEX) GPU image read-backs, written once their submission has completed (vk_debug_readbacks)
+// (vk_readback is one shared staging buffer, so each copy is submitted and waited for on its own; the first version
+// copied mid-frame and read pass-image saves instead)
+static struct { NvnTexture *t; char path[160]; } rb[4];
+static int nrb;
+void vk_debug_readbacks(void) {
+    for (int i = 0; i < nrb; i++) {
+        NvnTexture *t = rb[i].t;
+        TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+        const FormatInfo *fi = t ? t->layout.fmt : NULL;
+        if (!b || !b->image || !fi || !fi->bpb) continue;
+        uint32_t wb = (b->width + fi->bw - 1) / fi->bw, hb = (b->height + fi->bh - 1) / fi->bh;
+        uint64_t sz = (uint64_t)wb * hb * fi->bpb;
+        vk_end_pass();
+        VkSpan sp = vk_readback(sz);
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        VkBufferImageCopy rg = {.bufferOffset = sp.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageExtent = {b->width, b->height, 1}};
+        vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, sp.buf, 1, &rg);
+        vk_full_barrier(cb);
+        renderer_flush();
+        vk_wait_seq(submit_seq);
+        FILE *f = fopen(rb[i].path, "wb");
+        if (f) { fwrite(sp.ptr, 1, sz, f); fclose(f); }
+        LOG("[vk] read back %s (%llu bytes)\n", rb[i].path, (unsigned long long)sz);
+    }
+    nrb = 0;
+}
+
+// (F9) a shader texture's sampler: NVN wrap modes (0 CLAMP, 1 REPEAT, 2 MIRROR_CLAMP, 3 MIRROR_CLAMP_TO_EDGE,
+// 4 MIRROR_CLAMP_TO_BORDER, 5 CLAMP_TO_BORDER, 6 MIRRORED_REPEAT, 7 CLAMP_TO_EDGE), filters and border colour
+static void debug_sampler(int stage, ShaderTexture *st_) {
+    int slot = ((int)st_->handle_offset - 0x20) / 8;
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+    if (!h || !st.spool || tsc >= (uint32_t)st.spool->count) { LOG("[draw]     sampler: none (default)\n"); return; }
+    const NvnSamplerDesc *d = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+    LOG("[draw]     sampler %u: wrap %u %u %u min %u mag %u border %g %g %g %g", tsc, d->wrap[0], d->wrap[1], d->wrap[2],
+        d->min_filter, d->mag_filter, d->border[0], d->border[1], d->border[2], d->border[3]);
+    // the component swizzle the image view gets (vk_view: the pool view's if it sets one, else the texture's;
+    // NVN 0 zero, 1 one, 2 r, 3 g, 4 b, 5 a; all zero: never set, identity)
+    uint32_t tic = h & 0xFFFFF;
+    if (st.tpool && tic < (uint32_t)st.tpool->count) {
+        const NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        if (e->tex) {
+            const uint8_t *sw = e->has_view && (e->view.setmask & 8) ? e->view.swizzle : e->tex->swizzle;
+            LOG(" | swizzle %u %u %u %u (%s)", sw[0], sw[1], sw[2], sw[3], e->has_view && (e->view.setmask & 8) ? "view" : "texture");
+            if (e->has_view && (e->view.setmask & 4)) LOG(" view format %#x", e->view.format);
+        }
+    }
+    LOG("\n");
+}
+
 static bool is_attachment(NvnTexture *t) {
     if (!t) return false;
     if (t == st.rt.depth) return true;
@@ -1803,10 +1917,58 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 // holding an NVN memory pool are imported - the GPU only reads pools - since an import commits and pins all of its
 // pages (importing the arenas whole ran a 16 GB Windows PC out of commit). Other addresses read 0.
 // LARECOMP_VK_NO_GMEM=1: no imports, reads return zero.
-#define MAX_GCHUNKS 128
+// Ark: chunks are found through a table (maxwell_gmem_table): gch is indexed by chunk number (arena 0: 0..127,
+// arena 1: 128..255) and only imported chunks get a descriptor slot, so the device's slot limit (31 on MoltenVK)
+// covers every chunk holding a pool instead of the first 2 GB of a linear layout.
+#define MAX_GCHUNKS 256  // chunk numbers
+#define ARENA_CHUNKS 128
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint64_t base, size; bool failed; } GChunk;
 static GChunk gch[MAX_GCHUNKS];
-static struct { uint64_t base, size; int c0, n; } arenas[2];
+static struct { uint64_t base, size; int c0, n; } arenas[2];  // c0: the arena's first chunk number
+static int16_t slot_of[MAX_GCHUNKS], chunk_of_slot[128];      // (-1: none)
+static bool slots_init;
+static void slots_reset(void) {
+    for (int i = 0; i < MAX_GCHUNKS; i++) slot_of[i] = -1;
+    for (int i = 0; i < 128; i++) chunk_of_slot[i] = -1;
+    slots_init = true;
+}
+// Checks that the game never gives back pages under an import (kernel.c svcUnmapPhysicalMemory -> plat_discard): the
+// GPU would stall, and could go on reading the old pages
+static void gmem_discard_check(uint64_t addr, uint64_t size) {
+    for (int kn = 0; kn < MAX_GCHUNKS; kn++) {
+        const GChunk *c = &gch[kn];
+        if (!c->buf || addr >= c->base + c->size || addr + size <= c->base) continue;
+        static int n;
+        if (n++ < 8)
+            LOG("[vk] warning: guest pages %llx +%llu KB given back under imported chunk %d (%llx +%llu MB)\n",
+                (unsigned long long)addr, (unsigned long long)(size >> 10), kn, (unsigned long long)c->base,
+                (unsigned long long)(c->size >> 20));
+        return;
+    }
+}
+__attribute__((constructor)) static void gmem_discard_hook_install(void) {
+    extern void (*g_discard_hook)(uint64_t, uint64_t);
+    g_discard_hook = gmem_discard_check;
+}
+
+static void slot_assign(int kn) {
+    if (slot_of[kn] >= 0) return;
+    for (int i = 0; i < maxwell_gmem_chunks && i < 128; i++)
+        if (chunk_of_slot[i] < 0) {
+            chunk_of_slot[i] = (int16_t)kn, slot_of[kn] = (int16_t)i;
+            LOG("[vk] guest memory chunk %d (%llx +%llu MB) -> slot %d\n", kn, (unsigned long long)gch[kn].base,
+                (unsigned long long)(gch[kn].size >> 20), i);
+            return;
+        }
+    static int warned;
+    if (!warned++)
+        LOG("[vk] warning: more guest memory chunks hold pools than the %d descriptor slots: chunk %d (%llx) unreachable "
+            "from shaders (reads return zero)\n", maxwell_gmem_chunks, kn, (unsigned long long)gch[kn].base);
+}
+static void slots_free_arena1(void) {
+    for (int kn = ARENA_CHUNKS; kn < MAX_GCHUNKS; kn++)
+        if (slot_of[kn] >= 0) chunk_of_slot[slot_of[kn]] = -1, slot_of[kn] = -1;
+}
 static uint64_t arena_gen = ~0ull, pool_gen_seen = ~0ull;
 static uint64_t gmem_version;  // bumped whenever a chunk is (re)imported
 // NVN memory pools (backend_pool_created; objects.c), the ranges to import
@@ -1821,6 +1983,27 @@ void backend_pool_created(uint64_t addr, uint64_t size) {
     if (npools < 4096) { pools[npools].addr = addr; pools[npools].size = size; npools++; }
     pool_gen++;
     pthread_mutex_unlock(&pools_lock);
+}
+
+// Replaced imports (arena 0's regions grow as pools are added), freed once no pending submission can use them: kept
+// for good they piled up in MoltenVK's residency set until a level load ran the GPU out of memory (2026-11-03)
+static struct { VkBuffer buf; VkDeviceMemory mem; uint64_t seq; } gdead[256];
+static int ngdead;
+static void gmem_collect_dead(void) {
+    if (!ngdead) return;
+    uint64_t done = vk_completed_seq();
+    int k = 0;
+    for (int i = 0; i < ngdead; i++) {
+        if (gdead[i].seq <= done) { vkDestroyBuffer(g_vk.dev, gdead[i].buf, NULL); vkFreeMemory(g_vk.dev, gdead[i].mem, NULL); }
+        else gdead[k++] = gdead[i];
+    }
+    ngdead = k;
+}
+static void gmem_retire(GChunk *ch) {
+    if (!ch->buf) return;
+    if (ngdead == 256) { vk_wait_seq(submit_seq); gmem_collect_dead(); }
+    gdead[ngdead].buf = ch->buf, gdead[ngdead].mem = ch->mem, gdead[ngdead].seq = vk_pending_seq();
+    ngdead++;
 }
 
 static bool gmem_import(GChunk *ch, uint64_t base, uint64_t size) {
@@ -1846,7 +2029,7 @@ static bool gmem_import(GChunk *ch, uint64_t base, uint64_t size) {
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
-    // (a replaced chunk is kept: it pins the same pages and recorded work may still use it)
+    gmem_retire(ch);  // (the replaced import: freed once recorded work can no longer use it)
     *ch = (GChunk){buf, mem, base, size, false};
     gmem_version++;
     return true;
@@ -1865,22 +2048,43 @@ static void gmem_import_range(int a, uint64_t lo, uint64_t hi) {
     if (hi <= ab || lo >= ae) return;
     if (lo < ab) lo = ab;
     if (hi > ae) hi = ae;
+    if (!slots_init) slots_reset();
+    static int no_arena0 = -1;  // ARK_GMEM_NO_ARENA0=1: experiment, arena 0 (the small mappings) not imported
+    if (no_arena0 < 0) no_arena0 = getenv("ARK_GMEM_NO_ARENA0") && atoi(getenv("ARK_GMEM_NO_ARENA0"));
+    if (a == 0 && no_arena0) return;
     for (uint64_t k = (lo - ab) / cs; k <= (hi - 1 - ab) / cs; k++) {
-        int slot = arenas[a].c0 + (int)k;
-        if (slot < 0 || slot >= maxwell_gmem_chunks || (a == 0 && slot >= arenas[1].c0 && arenas[1].n)) break;
+        if (k >= ARENA_CHUNKS) break;
+        int kn = arenas[a].c0 + (int)k;
         uint64_t b = ab + k * cs, e = b + cs < ae ? b + cs : ae;
-        GChunk *ch = &gch[slot];
-        if (ch->failed || (ch->buf && ch->base + ch->size >= e)) continue;
+        GChunk *ch = &gch[kn];
+        if (a == 0) {
+            // Arena 0 (the small mappings: heaps the game grows and shrinks) imports only the pools' pages, 64 KB-aligned:
+            // svcUnmapPhysicalMemory there swaps pages for fresh ones (plat_discard), and an import over them stalled the
+            // GPU for ~75 ms each time and cost 5-15 ms a frame (2026-11-03). The slot's offset in its chunk: gmo.
+            uint64_t rb = lo & ~0xFFFFull, re = (hi + 0xFFFF) & ~0xFFFFull;
+            if (rb < b) rb = b;
+            if (re > e) re = e;
+            if (ch->buf) {  // (another pool in the same chunk: the union of the two)
+                if (ch->base < rb) rb = ch->base;
+                if (ch->base + ch->size > re) re = ch->base + ch->size;
+                if (rb == ch->base && re == ch->base + ch->size) continue;
+            } else if (ch->failed) continue;
+            b = rb, e = re;
+        } else if (ch->failed || (ch->buf && ch->base + ch->size >= e)) continue;
         if (!gmem_import(ch, b, e - b)) {
             ch->failed = true;
             LOG("[vk] guest memory import failed at %llx (+%llu MB): shader reads there return zero\n", (unsigned long long)b,
                 (unsigned long long)((e - b) >> 20));
+            continue;
         }
+        slot_assign(kn);
+        gmem_version++;
     }
 }
 
 // Re-reads the physical mappings and pools when they changed and imports what is new.
 static void gmem_update(void) {
+    gmem_collect_dead();
     if (gmem_off() || (kernel_phys_gen() == arena_gen && atomic_load(&pool_gen) == pool_gen_seen)) return;
     uint64_t gen, ra[1024], rs[1024];
     int n = kernel_phys_regions(ra, rs, 1024, &gen);
@@ -1894,8 +2098,10 @@ static void gmem_update(void) {
         uint64_t b = ra[big] & ~0xFFFFull, e = (ra[big] + rs[big] + 0xFFFF) & ~0xFFFFull;
         if (arenas[1].base != b || arenas[1].size != e - b) {
             int nc = (int)((e - b + cs - 1) / cs);
-            arenas[1] = (typeof(arenas[1])){b, e - b, maxwell_gmem_chunks - nc, nc};
-            for (int i = arenas[1].c0; i < maxwell_gmem_chunks; i++) if (i >= 0) memset(&gch[i], 0, sizeof gch[i]);
+            if (!slots_init) slots_reset();
+            arenas[1] = (typeof(arenas[1])){b, e - b, ARENA_CHUNKS, nc};
+            slots_free_arena1();
+            for (int i = ARENA_CHUNKS; i < MAX_GCHUNKS; i++) memset(&gch[i], 0, sizeof gch[i]);
             gmem_version++;
             LOG("[vk] guest memory arena 1: %llx..%llx (%d chunks)\n", (unsigned long long)b, (unsigned long long)e, nc);
         }
@@ -1908,7 +2114,7 @@ static void gmem_update(void) {
     }
     if (hi > lo) {
         if (!arenas[0].size) arenas[0].base = lo & ~0xFFFFull;  // (arena 0's base stays: chunks are only added)
-        uint64_t e = (hi + 0xFFFF) & ~0xFFFFull, maxe = arenas[0].base + (uint64_t)(arenas[1].n ? arenas[1].c0 : maxwell_gmem_chunks) * cs;
+        uint64_t e = (hi + 0xFFFF) & ~0xFFFFull, maxe = arenas[0].base + (uint64_t)ARENA_CHUNKS * cs;
         if (e > maxe) e = maxe;
         if (e > arenas[0].base + arenas[0].size) { arenas[0].size = e - arenas[0].base; gmem_version++; }
     }
@@ -1927,20 +2133,37 @@ static VkDescriptorSet gmem_set(void) {
     gmem_update();
     uint64_t seq = vk_pending_seq();
     if (set && set_seq == seq && set_ver == gmem_version) return set;
-    set = vk_alloc_set(g_gmem_layout);
+    set = g_vk.gmem_uab ? vk_alloc_gmem_set(g_gmem_layout) : vk_alloc_set(g_gmem_layout);
     set_seq = seq;
     set_ver = gmem_version;
     static uint32_t zero[64];
     VkSpan zs = vk_transient_copy(zero, sizeof zero, 256);
-    VkDescriptorBufferInfo bi[MAX_GCHUNKS];
-    for (int i = 0; i < maxwell_gmem_chunks; i++)
-        bi[i] = gch[i].buf ? (VkDescriptorBufferInfo){gch[i].buf, 0, gch[i].size} : (VkDescriptorBufferInfo){zs.buf, zs.off, sizeof zero};
-    uint32_t m[12] = {0};
+    if (!slots_init) slots_reset();
+    VkDescriptorBufferInfo bi[128];
+    for (int i = 0; i < maxwell_gmem_chunks; i++) {
+        int kn = chunk_of_slot[i];
+        bi[i] = kn >= 0 && gch[kn].buf ? (VkDescriptorBufferInfo){gch[kn].buf, 0, gch[kn].size}
+                                       : (VkDescriptorBufferInfo){zs.buf, zs.off, sizeof zero};
+    }
+    uint32_t m[12 + 64 + 128] = {0};  // gmm[3] (arena bases / sizes), gmt (a byte per chunk number: its slot or 0xFF), gmo
     for (int a = 0; a < 2; a++) {
         uint64_t b = arenas[a].size ? arenas[a].base : 0, z = arenas[a].size;
         m[a * 4] = (uint32_t)b; m[a * 4 + 1] = (uint32_t)(b >> 32); m[a * 4 + 2] = (uint32_t)z; m[a * 4 + 3] = (uint32_t)(z >> 32);
     }
     m[8] = (uint32_t)arenas[1].c0;
+    for (int kn = 0; kn < MAX_GCHUNKS; kn++) {
+        uint32_t v = slot_of[kn] >= 0 && gch[kn].buf ? (uint32_t)slot_of[kn] : 0xFFu;
+        m[12 + kn / 4] |= v << ((kn & 3) * 8);
+    }
+    // gmo: each slot's buffer start within its chunk (arena 0 imports only the pools' pages)
+    uint64_t csz = 1ull << maxwell_gmem_chunk_log2;
+    for (int i = 0; i < maxwell_gmem_chunks && i < 128; i++) {
+        int kn = chunk_of_slot[i];
+        if (kn < 0 || !gch[kn].buf) continue;
+        int a = kn >= ARENA_CHUNKS;
+        uint64_t cb = arenas[a].base + (uint64_t)(kn - arenas[a].c0) * csz;
+        m[12 + 64 + i] = (uint32_t)(gch[kn].base - cb);
+    }
     VkSpan ms = vk_transient_copy(m, sizeof m, 256);
     VkDescriptorBufferInfo mi = {ms.buf, ms.off, sizeof m};
     VkWriteDescriptorSet w[2] = {
@@ -1960,7 +2183,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy) return false;
     gmem_update();
-    for (int i = 0; i < maxwell_gmem_chunks; i++)
+    for (int i = 0; i < MAX_GCHUNKS; i++)
         if (gch[i].buf && addr >= gch[i].base && addr + size <= gch[i].base + gch[i].size) {
             *buf = gch[i].buf;
             *off = addr - gch[i].base;
@@ -1984,6 +2207,7 @@ void vk_exec_reset(void) {
         if (gch[i].buf) { vkDestroyBuffer(g_vk.dev, gch[i].buf, NULL); vkFreeMemory(g_vk.dev, gch[i].mem, NULL); }
     memset(gch, 0, sizeof gch);
     memset(arenas, 0, sizeof arenas);
+    slots_reset();
     arena_gen = pool_gen_seen = ~0ull;
     pthread_mutex_lock(&pools_lock);
     npools = 0;
@@ -2041,7 +2265,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
-                                 const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
+                                 const float tint[12], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
     VkDescriptorSet ds = vk_alloc_set(layout);
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
@@ -2085,8 +2309,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
         } else {
-            float zero[8] = {0};
-            bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
+            float zero[12] = {0};  // (tint: two vec4s; [8], [9]: the alpha test's function and reference)
+            bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 48, 256), 48);
         }
         w[n].pBufferInfo = &bi[n];
         n++;
@@ -2154,11 +2378,48 @@ static CsProg *compute_program(NvnProgram *np) {
     return cp;
 }
 
+// (F9) a debug frame's dispatches: program, groups, storage / uniform bindings (GPU particle simulations write their
+// particle buffers here: the rain, 2026-11-03) and the GLSL once per program in build/glsl-f9/<cs>_cs.glsl
+static void debug_dispatch(CsProg *cp, uint32_t gx, uint32_t gy, uint32_t gz, const char *what) {
+    uint64_t cs = st.program->stages[5].code_addr;
+    LOG("[dispatch] %s cs=%llx groups %ux%ux%u local %ux%ux%u gmem %d", what, (unsigned long long)cs, gx, gy, gz,
+        cp ? cp->local[0] : 0, cp ? cp->local[1] : 0, cp ? cp->local[2] : 0, cp && cp->si ? cp->si->uses_gmem : -1);
+    if (cp && cp->si) LOG(" cbufs %#x", cp->si->cbuf_mask);
+    LOG("\n");
+    for (int i = 0; i < 16; i++)
+        if (st.sbuf[5][i].addr)
+            LOG("[dispatch]   sbuf%d %llx size %llu\n", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+    for (int i = 0; i < 18; i++)
+        if (st.ubuf[5][i].addr) {
+            const float *u = (const float *)(uintptr_t)st.ubuf[5][i].addr;
+            LOG("[dispatch]   ubuf%d (cb%d) %llx size %u:", i, i + 3, (unsigned long long)st.ubuf[5][i].addr, (unsigned)st.ubuf[5][i].size);
+            for (int k = 0; k < 24 && k * 4 < (int)st.ubuf[5][i].size; k++) LOG(" %.6g", u[k]);
+            LOG("\n");
+        }
+    static uint64_t saved[256];
+    static int nsaved;
+    bool have = false;
+    for (int i = 0; i < nsaved; i++) have |= saved[i] == cs;
+    if (!have && nsaved < 256 && cp && cp->si && cp->si->msl) {
+        saved[nsaved++] = cs;
+        mkdir("build/glsl-f9", 0755);
+        char path[96];
+        snprintf(path, sizeof path, "build/glsl-f9/%llx_cs.glsl", (unsigned long long)cs);
+        FILE *f = fopen(path, "w");
+        if (f) { fputs(cp->si->msl, f); fclose(f); }
+    }
+}
+
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
-    if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
+    if (!cp || atomic_load(&cp->p.state) != 1) {
+        if (g_debug_frame) debug_dispatch(cp, gx, gy, gz, !cp ? "SKIPPED (no program)" : atomic_load(&cp->p.state) == 2 ? "SKIPPED (failed)" : "SKIPPED (building)");
+        stat_skipped++;
+        return;
+    }
+    if (g_debug_frame) debug_dispatch(cp, gx, gy, gz, "run");
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
@@ -2168,8 +2429,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
-    VkDescriptorSet gs = gmem_set();
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, GMEM_SET, 1, &gs, 0, NULL);
+    if (cp->si->uses_gmem) {  // (see draw_)
+        VkDescriptorSet gs = gmem_set();
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, GMEM_SET, 1, &gs, 0, NULL);
+    }
     vkCmdDispatch(cb, gx, gy, gz);
     stat_dispatches++;
 }
@@ -2215,12 +2478,13 @@ static void draw(CmdRec *r, bool indexed) {
     // (debug frames, ARK_F9_SPLIT_BLEND=1) end the pass after each blended draw into a target with depth, so each one's
     // result is saved as its own pass image: finds the draw that paints the dark trails in the opening
     static int split = -1;
-    if (split < 0) split = getenv("ARK_F9_SPLIT_BLEND") != NULL;
+    if (split < 0) split = getenv("ARK_F9_SPLIT_BLEND") ? atoi(getenv("ARK_F9_SPLIT_BLEND")) : 0;  // (=0: off; =2: passes
+                                                                                                 //  without depth: HUD)
     static uint64_t split_frame = ~0ull;
     static int nsplit;
-    if (split && g_debug_frame && in_pass && st.rt.depth && (st.color_state[0] & 1)) {
+    if (split && g_debug_frame && in_pass && (split == 2 ? !st.rt.depth : st.rt.depth != NULL) && (st.color_state[0] & 1)) {
         if (renderer_present_count() != split_frame) { split_frame = renderer_present_count(); nsplit = 0; }
-        if (nsplit++ < 80) { LOG("[draw]   (split: pass ends here)\n"); vk_end_pass(); }
+        if (nsplit++ < 160) { LOG("[draw]   (split: pass ends here)\n"); vk_end_pass(); }
     }
 }
 // ARK_LOG_SHADOW=1: every distinct kind of draw into a square render target of 512..4096 (the shadow cascades), once:
@@ -2500,7 +2764,13 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (b && b->tp > 0 && texpatch_is_item_cursor(b->tp - 1)) { stat_skipped++; return; }
             }
     }
-    float tint[8] = {0};
+    float tint[12] = {0};
+    {   // the alpha test (NVN fixed function; the shader discards: maxwell/translate.c). 8 = always: off
+        static int no_at = -1;  // ARK_NO_ALPHA_TEST=1: off (comparison)
+        if (no_at < 0) no_at = getenv("ARK_NO_ALPHA_TEST") && atoi(getenv("ARK_NO_ALPHA_TEST"));
+        uint8_t af = st.color_state[2];
+        if (!no_at && af >= 1 && af <= 7) tint[8] = af, tint[9] = st.alpha_ref;
+    }
     if (pr->fi->uses_tint) {
         extern bool pot_tint(const float *m, float tint[8], uint64_t mesh);
         extern bool pot_glow_active(void);
@@ -2607,8 +2877,11 @@ static void draw_(CmdRec *r, bool indexed) {
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii);
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
-    VkDescriptorSet sets[3] = {vset, fset, gmem_set()};
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 3, sets, 0, NULL);
+    // the global memory set only for programs that read or write guest memory: binding it marks every chunk as used
+    // (MoltenVK: one useResource per chunk per bind), which with 128 chunks halved the frame rate in the rain
+    bool gm = pr->vi->uses_gmem || pr->fi->uses_gmem;
+    VkDescriptorSet sets[3] = {vset, fset, gm ? gmem_set() : VK_NULL_HANDLE};
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, gm ? 3 : 2, sets, 0, NULL);
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -2728,7 +3001,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
-            float rtint[8] = {0};
+            float rtint[12] = {0};
+            rtint[8] = tint[8], rtint[9] = tint[9];
             extern void pot_gold_tint(float tint[8]);
             if (run_gold[ri]) pot_gold_tint(rtint);
             VkDescriptorSet rset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, rtint, 0, 0, 0, fii);
@@ -2788,6 +3062,14 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (!(st.color_state[0] & 1) && st.color_state[2] != 8)  // (blending off: the alpha test still applies)
+        LOG("[draw]   (no blending) alpha test %u ref %g\n", st.color_state[2], st.alpha_ref);
+    if (st.color_state[0] & 1) {  // blend target 0: NVN blend state bytes (target, src/dst colour, src/dst alpha factors, ops)
+        const uint8_t *bs = st.blend[0];
+        LOG("[draw]   blend0 bytes %02x %02x %02x %02x %02x %02x %02x %02x | blend colour %g %g %g %g | alpha test %u ref %g\n",
+            bs[0], bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7], st.blend_color[0], st.blend_color[1], st.blend_color[2],
+            st.blend_color[3], st.color_state[2], st.alpha_ref);
+    }
     if (st.ds[3]) {  // stencil test: ops (fail, zfail, zpass) and func per face, ref, write and compare masks
         uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
         LOG("[draw]   stencil%s front ops %x/%x/%x func %x ref %#x wmask %#x cmask %#x | back ops %x/%x/%x func %x ref %#x wmask %#x"
@@ -2803,32 +3085,46 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
             LOG("\n");
         }
-        for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
-            const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
-            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
-            LOG("\n");
+        // cbuf_mask bits are hardware slots (the GLSL's cb<N>); the game's uniform binding is N - 3 (cbuf_info)
+        for (int stg = 1; stg >= 0; stg--) {  // fragment, then vertex (particle emitters keep per-frame data there)
+            uint32_t mask = stg ? pr->fi->cbuf_mask : pr->vi->cbuf_mask;
+            for (int c = 3; c < 21; c++) {
+                const Range *rg = &st.ubuf[stg][c - 3];
+                if (!((mask >> c) & 1) || !rg->addr) continue;
+                const float *u = (const float *)(uintptr_t)rg->addr;
+                LOG("[draw]   %ccb%d (binding %d) %llx size %u:", stg ? 'f' : 'v', c, c - 3, (unsigned long long)rg->addr,
+                    (unsigned)rg->size);
+                for (int k = 0; k < 192 && k * 4 < (int)rg->size; k++) LOG(" %.6g", u[k]);  // (768 bytes: UI tables)
+                LOG("\n");
+            }
         }
     }
-    {   // LARECOMP_WATCH_VS=<vertex shader address>: for the first draw with it, log its vertex cbufs and watch the start
+    {   // LARECOMP_WATCH_VS=<vertex shader address> or inst<N>: for the first draw with it, log its vertex cbufs and watch the start
         // of its vertex streams and cbufs (names the code that fills per-instance data: [watch] lines)
         static int done;
         const char *wv = getenv("LARECOMP_WATCH_VS");
-        if (wv && !done && st.program->stages[0].code_addr == strtoull(wv, NULL, 16)) {
+        // (=inst<N>: the first draw with N instances instead: effect shaders load at a different address each run)
+        bool match = wv && (!strncmp(wv, "inst", 4) ? (uint64_t)strtoull(wv + 4, NULL, 10) == (indexed ? r->x[6] : r->x[4])
+                                                   : st.program->stages[0].code_addr == strtoull(wv, NULL, 16));
+        if (match && !done) {
             done = 1;
             extern void watch_add(uint64_t, uint64_t), watch_arm(void);
-            for (int s = 0; s < 4; s++) if (st.vbuf[s].addr) {
+            // (vertex streams only with LARECOMP_WATCH_VBUF=1: the GPU reads vertex data in place from imported guest
+            // memory, and a GPU read of a protected page stalls it for good: the game hangs)
+            for (int s = 0; s < 4 && getenv("LARECOMP_WATCH_VBUF"); s++) if (st.vbuf[s].addr) {
                 LOG("[draw]   watch vbuf%d %llx\n", s, (unsigned long long)st.vbuf[s].addr);
                 watch_add(st.vbuf[s].addr, st.vbuf[s].addr + 64);
             }
-            for (int cb = 0; cb < 18; cb++) {
-                if (!((pr->vi->cbuf_mask >> cb) & 1) || !st.ubuf[0][cb].addr) continue;
+            LOG("[draw]   watch: vs=%llx\n", (unsigned long long)st.program->stages[0].code_addr);
+            for (int hc = 3; hc < 21; hc++) {
+                int cb = hc - 3;  // (binding; the mask is in hardware slots)
+                if (!((pr->vi->cbuf_mask >> hc) & 1) || !st.ubuf[0][cb].addr) continue;
                 const float *u = (const float *)(uintptr_t)st.ubuf[0][cb].addr;
-                LOG("[draw]   vcb%d %llx size %u:", cb, (unsigned long long)st.ubuf[0][cb].addr, (unsigned)st.ubuf[0][cb].size);
+                LOG("[draw]   vcb%d (binding %d) %llx size %u:", hc, cb, (unsigned long long)st.ubuf[0][cb].addr, (unsigned)st.ubuf[0][cb].size);
                 for (int k = 0; k < 64 && k * 4 < (int)st.ubuf[0][cb].size; k++) LOG(" %.6g", u[k]);
                 LOG("\n");
-                watch_add(st.ubuf[0][cb].addr, st.ubuf[0][cb].addr + 64);
+                // (not the bound range itself: the render thread copies it every frame (cbuf_info), and a render-thread
+                // fault on a watched page deadlocks the signal handler: only the copies found below are watched)
                 // the same 32 bytes elsewhere in the game's memory: where it was copied from (watched too)
                 extern int kernel_phys_regions(uint64_t *, uint64_t *, int, uint64_t *);
                 uint64_t ra[256], rs[256], gen;
@@ -2863,10 +3159,41 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
+        debug_sampler(1, &pr->fi->tex[i]);
         uint64_t nz = 0, lo = ~0ull, hi = 0;  // guest memory: non-zero bytes (CPU-written contents?) and where
         if (t->addr) for (uint64_t k = 0; k < (16u << 20) && k < (uint64_t)t->width * t->height; k++)
             if (((const uint8_t *)(uintptr_t)t->addr)[k]) { nz++; if (k < lo) lo = k; hi = k; }
         if (nz) LOG("[draw]   (stride %llu, non-zero bytes %llx..%llx)\n", (unsigned long long)t->stride, (unsigned long long)lo, (unsigned long long)hi);
+        if (t->addr && getenv("LARECOMP_DEBUG_DATA")) {  // the texture's own bytes (tegra_total_size): 0xFF count, first 16
+            uint64_t tot = tegra_total_size(&t->layout), ff = 0;
+            const uint8_t *m = (const uint8_t *)(uintptr_t)t->addr;
+            for (uint64_t k = 0; k < tot && k < (16u << 20); k++) ff += m[k] == 0xFF;
+            LOG("[draw]   (data %llu bytes, %llu are 0xFF, first:", (unsigned long long)tot, (unsigned long long)ff);
+            for (int k = 0; k < 16 && (uint64_t)k < tot; k++) LOG(" %02x", m[k]);
+            LOG(")\n");
+        }
+        {   // LARECOMP_DUMP_TEX=<w>x<h>: the raw guest bytes of matching textures, once per frame each, for offline
+            // decoding: build/texdump_<addr>_<w>x<h>_f<format>_bh<block height log2>.bin
+            static int dw = -1, dh;
+            if (dw < 0) { dw = 0; const char *e = getenv("LARECOMP_DUMP_TEX"); if (e) sscanf(e, "%dx%d", &dw, &dh); }
+            if (dw && t->addr && (int)t->width == dw && (int)t->height == dh) {
+                char path[160];
+                snprintf(path, sizeof path, "build/texdump_%llx_%ux%u_f%x_bh%u.bin", (unsigned long long)t->addr, t->width,
+                         t->height, t->format, t->layout.block_height_log2);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite((const void *)(uintptr_t)t->addr, 1, tegra_total_size(&t->layout), f); fclose(f); }
+                LOG("[draw]   (dumped %s)\n", path);
+                // and the GPU image's level 0 as the GPU holds it (raw blocks / texels, linear), read back at the next
+                // present on its own (vk_debug_readbacks): build/texgpu_<addr>_..._vkfmt<n>.bin
+                if (b && b->image && nrb < 4) {
+                    rb[nrb].t = t;
+                    snprintf(rb[nrb].path, sizeof rb[nrb].path, "build/texgpu_%llx_%ux%u_vkfmt%d_lv%u.bin",
+                             (unsigned long long)t->addr, b->width, b->height, (int)b->format, b->levels);
+                    nrb++;
+                    LOG("[draw]   (GPU image to be read back to %s at the next present)\n", rb[nrb - 1].path);
+                }
+            }
+        }
         if (nz && b && b->format == VK_FORMAT_R8_UNORM && b->width >= 1024 && getenv("LARECOMP_DUMP_R8")) {
             static int nd;
             char path[64];
@@ -3477,6 +3804,7 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.depth_range[r->x[0] + i], (uint8_t *)x + i * 8, 8);
             break;
         case CMD_SET_BLEND_COLOR: memcpy(st.blend_color, x, 16); break;
+        case CMD_SET_ALPHA_REF: st.alpha_ref = r->f[0]; break;
         case CMD_SET_STENCIL: {
             int face = (int)r->x[0];
             for (int f = 0; f < 2; f++) {
@@ -3532,6 +3860,14 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        // (not implemented: dropped. F9 logs them so a missing effect can be traced to one)
+        case CMD_DISPATCH_INDIRECT: case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: {
+            static int nwarn;
+            if (g_debug_frame || nwarn++ < 4)
+                LOG("[%s] INDIRECT dropped (indirect buffer %llx, %llx)\n", r->op == CMD_DISPATCH_INDIRECT ? "dispatch" : "draw",
+                    (unsigned long long)r->x[0], (unsigned long long)r->x[1]);
+            break;
+        }
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_BIND_XFB_BUFFERS:
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 4; i++) memcpy(&st.xfb_buf[r->x[0] + i], (uint8_t *)x + i * 16, 16);

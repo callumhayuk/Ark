@@ -273,3 +273,100 @@ This environment is ephemeral. To get back to the current state:
 - **Logging:** `[save] open / create / read / write` lines in `ark.log` for every save-data mount (they used to fire
   only for paths containing "savedata", a leftover from LAS Recomp, so never for this game).
 - `save/` is git-ignored: save files are the player's, not source.
+
+## 2026-11-04: shiny and alpha rate sliders (F1 > Gameplay)
+
+- **Shiny rate** (0..500, `shiny_rolls` in ark.ini, default 1): pml's Pokémon creation (main+0x2B8BAC0) in PID mode
+  0x3_FFFFFFFF draws up to `[spec+57]` PIDs and keeps the first shiny one (1 in 4096 each; the game's count is 1, +3
+  Shiny Charm, +1 / +3 research, +25 / +12 outbreaks). Patch `shiny_rolls` (main+0x2B8BC28, `ldrb w8, [x19, #57]`)
+  multiplies that count (`ark_shiny_rolls`). At 0, patch `shiny_mode` (main+0x2B8BBFC, the mode load) turns the mode
+  into 0x1_FFFFFFFF, the game's own "random, never shiny" (`ark_shiny_mode`). Covers everything made in that mode
+  (wild spawns, outbreaks, gifts whose shininess is random); fixed and shiny-locked ones use other modes.
+- **Alpha rate** (0..100, `alpha_rolls`, default 1): the spawner (main+0xF94470) picks an encounter slot with
+  main+0xF95DA0(slots, time, weather, mode, alpha_only, rng), a weighted pick among the slots allowed now; a slot is
+  an alpha one when either bool of its field 46 is set (the spawner then forces size 255 and 3 perfect IVs). Alpha
+  spawn points pass alpha_only and are left alone. Patch `alpha_pick` (main+0xF944B8, the `bl`) calls
+  `ark_alpha_pick`, which repeats the pick up to N times until it lands on an alpha slot (at 0: up to 32 times until
+  it doesn't). Odds: the pick's (slot, weight) table is still in its stack frame after it returns (64 x 16 bytes at
+  caller sp - 0x590 + 8), so the alpha share of the last ordinary table is read from there.
+- Menu: two sliders under Gameplay, with odds under each (shiny: no bonuses, Shiny Charm + perfect entry, and the
+  last Pokémon's own count; alpha: the last spawn table's share before and after). Applied live, saved on release.
+- The three patches are in `tools/lifter/patches.py`; the checked-out `generated/main/main_1203.c` and `main_373.c`
+  were edited the same way so a rebuild picks them up without `make gen`.
+
+## 2026-11-03: overlay menu (F1)
+
+- `runtime/ui/menu.cpp`: Dear ImGui (`third_party/imgui`, v1.91.9) drawn by its Vulkan backend into the window image
+  after the game's picture (`device.c backend_present -> menu_render`, dynamic rendering, swapchain format; device
+  handles from `vk_menu_device`). Replaces the no-op hooks in `ui_none.c`.
+- Sections: **Visual** (60 fps F2, with text pace F5 and table 2 F6 under it, enabled at 60 fps; full-detail models
+  F3; grass F4; terrain range F7) and **Gameplay** (game speed F8; shiny and alpha rates, 2026-11-04).
+- Threads: events on the window thread, frames on the render thread, ImGui's context under one mutex. The menu
+  queues switch changes and the window thread applies them (`menu_apply_window_requests`), like the F keys, so the
+  switches only change on that thread. New setters `ark_terrain_set` / `ark_speed_set` (`patches.c`).
+- Input: F1 toggles, Esc closes; mouse, keyboard navigation and controller navigation. While open the game gets no
+  buttons or sticks (`menu_input_captured`); key / pad events still reach `hle/input.c` so held-key state stays
+  right. Font: a system TTF (Arial / Segoe UI / DejaVu) at 16 px x the window's pixel density, else ImGui's own.
+- **Render resolution** (Visual, top): sets `g_settings.res_mode` (Match window, 75/50/25 %, 1x..4x, Dynamic) and
+  saves `ark.ini`. `output_scale()` reads it every presented frame; scalable targets (every 16:9 render target, which
+  includes the final image the HUD is drawn into) reallocate on next use, so the HUD scales with it. Shows the size
+  rendered at (`renderer_get_scale`).
+- **Frame rate counter** (top left, on by default; Visual > "Frame rate counter", `show_fps` in ark.ini): presented
+  frames per second over half-second windows, the average frame time and the slowest frame. Drawn by the overlay
+  even while the menu is closed.
+- `LARECOMP_MENU_AT=<frame>` opens it for screenshot tests. F11 (fullscreen) is still not wired up.
+
+## 2026-11-03: rain doesn't fall (cause found; fix to test)
+
+- The rain is a GPU particle simulation: compute shader 89fb7dc000 (13 x 32 threads, one per drop) rewrites the
+  drops' buffers (storage buffers 0-4 = the draw's vertex streams) each frame; the draw (400 instances, vertex shader
+  89fb7c5000) only wraps the positions into a box around the camera (hence the flicker when the camera turns: the
+  shader itself has no time term; cb12[0] is a fixed per-layer offset).
+- **Cause:** the simulation reads its emitter through global memory (LDG from cb10's address, 0x8245506200, in
+  arena 0). Shader global memory is one storage-buffer descriptor array of 64 MB chunks, capped by
+  maxPerStageDescriptorStorageBuffers: **31 on MoltenVK**, against 128 needed for 8 GB. Arena 1 (51 chunks) took the
+  top slots and arena 0 got none, so every global read there returned 0 and writes were dropped. Mac only (Windows
+  drivers allow 128). Other GPU-simulated effects were probably affected the same way.
+- **Fix:** chunks are found through a table (maxwell/translate.c `maxwell_gmem_table`, exec.c `slot_assign`). Each
+  arena has 128 fixed chunk numbers (arena 0: 0..127, arena 1: 128..255); only chunks that hold NVN memory pools are
+  imported, and each imported chunk takes the next descriptor slot. Shaders look the slot up in GMemMap's `gmt` (one
+  byte per chunk number, 0xFF: not imported, reads zero). The plain set's 31 slots then cover every pool chunk, as
+  long as at most 31 chunks hold pools: `[vk] guest memory chunk N (...) -> slot S` lines list them, and a warning
+  says when a chunk got none. (SPIR-V cache entries are keyed by the shader source: no stale shaders.)
+- **Arena 0 imports only the pools' pages** (64 KB-aligned, the union of the pools in each chunk; GMemMap `gmo` gives
+  each slot's offset in its chunk). Importing arena 0 in whole 64 MB chunks cost 5-15 ms of GPU time a frame plus a
+  ~75 ms stall every 7-13 frames (Shift+F9: one tiny pass "taking" 75 ms, a different one each time); without arena 0
+  (`ARK_GMEM_NO_ARENA0=1`) GPU time was a steady 16 ms. Arena 0 holds heaps the game grows and shrinks, and
+  svcUnmapPhysicalMemory swaps their pages for fresh ones (plat_discard: vm_allocate OVERWRITE) under the import.
+  A warning (`guest pages ... given back under imported chunk`) now reports any unmap under an import.
+- **Rejected first fix:** an update-after-bind set with 128 linear slots (`ARK_GMEM_UAB=1` still selects it, now with
+  the table too). The rain fell, but the frame rate halved (15 fps against a steady 30), and binding the set only for
+  programs that use global memory (kept) still left 18-22 fps: the render thread waited on the GPU ~60% of the time,
+  presumably MoltenVK making every chunk resident per encoder.
+- Debug tooling fixed on the way: the F9 debug-data cbuf logs indexed `st.ubuf` by hardware slot instead of binding
+  (slot - 3), so earlier `fcbN` lines were mislabelled; the watch no longer protects bound cbufs or vertex streams
+  (the renderer / GPU read them: hangs), and a host thread touching a watched page now turns the watch off instead of
+  deadlocking in the signal handler. `ARK_F9_SPLIT_BLEND=0` now means off.
+
+## 2026-11-03: area-name banner shows a cream box for its first second (cause found; fix to test)
+
+- The box is one draw (ARK_F9_SPLIT_BLEND=2: a pass image after each blended HUD draw): the area-name silhouette, a
+  700x140 BC4 texture (view swizzle ONE ONE ONE R: white, alpha = red) drawn during the reveal with blending ONE /
+  ZERO for colour and alpha: an overwrite that ignores alpha (the HUD icons, same shader / format / swizzle, blend
+  SRC_ALPHA / ONE_MINUS_SRC_ALPHA). The texture is right: guest data decoded offline, and the GPU image read back
+  byte for byte equal to it.
+- **Cause:** such draws rely on NVN's fixed-function alpha test (nvnColorStateSetAlphaTest, colour state byte 2;
+  nvnCommandBufferSetAlphaRef) to drop their transparent texels. Ark stored both and implemented neither, so the whole
+  quad was overwritten in cream until the reveal ended.
+- **Fix:** the alpha test in the fragment shader: the Tint block (binding 19) grows to ltint[3], [2] = (function,
+  reference), set per draw (exec.c draw_, CMD_SET_ALPHA_REF); the GLSL discards when c0.a fails it. The F9 blend line
+  prints the alpha test.
+- Ruled out on the way (each with its own test): texture change detection, sampler wrap, swizzles (an A-for-ONE
+  rewrite, ARK_SWIZZLE_ONE_TO_A=1, kept as an option), the view caches, Metal argument buffers (that run broke most
+  drawing, so the box vanishing proved little). A first GPU read-back was wrong: vk_readback is one shared buffer and
+  the pass-image saves overwrote it; it now runs on its own at the next present.
+- nvnTextureFinalize runs on other threads than the submitting one; it now takes one lock with command execution and
+  presentation (nvn/objects.c). A real race, not this bug.
+- Debug tooling added on the way: F9 prints each fragment texture's sampler and effective swizzle, and with
+  LARECOMP_DEBUG_DATA its byte count / 0xFF count / first bytes; LARECOMP_DUMP_TEX=<w>x<h> dumps matching textures'
+  raw bytes; ARK_F9_SPLIT_BLEND=2 splits passes without depth (the HUD) after each blended draw.

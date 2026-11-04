@@ -334,6 +334,18 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
     while (p < nwpage && watch_pages[p] != pg) p++;
     if (p == nwpage) return false;
     plat_protect(pg, PLAT_PAGE, PLAT_PROT_RW);
+    // Ark: only guest threads may run into a watch. A host thread (the renderer reading a watched constant buffer, the
+    // GPU's memory imports) faulting again and again on pages the watch thread keeps closing deadlocks in this handler
+    // (dladdr / stdio in a signal handler); the game hung in the rain, 2026-11-03. Its first touch turns the watch off.
+    extern struct KThread *kernel_current_thread(void);
+    if (!kernel_current_thread()) {
+        watch_on = 0, watch_done = 1;
+        for (int i = 0; i < nwpage; i++) plat_protect(watch_pages[i], PLAT_PAGE, PLAT_PROT_RW);
+        static const char msg[] = "[watch] a host thread touched a watched page: watch off\n";
+        write(2, msg, sizeof msg - 1);  // (async-signal-safe)
+        pend_w = -1;
+        return true;
+    }
     pend_w = -1;
     for (int w = 0; w < nwatch; w++) {
         if (fa < watches[w].lo || fa >= watches[w].hi) continue;

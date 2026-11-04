@@ -1,4 +1,5 @@
 // NVN objects, builders, and state objects (everything except command recording).
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -110,10 +111,31 @@ NVN(nvnQueueGetTotalCommandMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalControlMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalComputeMemoryUsed) { RET(0); }
 NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
+// Ark: command execution (the submitting thread), presentation and texture destruction (nvnTextureFinalize: any thread,
+// e.g. a loader at an area change) share the backend's state: the image view cache, the deferred-free list, the
+// textures themselves. Unserialised, a texture freed mid-execution left a view of its freed image behind for the next
+// texture at the same address, and rendering went on into memory reallocated to the area-name banner's textures (an
+// opaque box, 2026-11-04). One recursive lock serialises them.
+static pthread_mutex_t g_backend_lock;
+static pthread_once_t g_backend_lock_once = PTHREAD_ONCE_INIT;
+static void backend_lock_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_backend_lock, &a);
+}
+static void backend_lock(void) { pthread_once(&g_backend_lock_once, backend_lock_init); pthread_mutex_lock(&g_backend_lock); }
+static void backend_unlock(void) { pthread_mutex_unlock(&g_backend_lock); }
+
+static void *g_submit_thread;  // (the last thread to submit commands: nvnTextureFinalize logs when it differs)
+
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
+    g_submit_thread = kernel_current_thread();
+    backend_lock();
     for (int i = 0; i < n; i++) backend_execute(handles[i]);
+    backend_unlock();
 }
 NVN(nvnQueueFlush) { (void)c; }
 NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
@@ -367,7 +389,12 @@ NVN(nvnTextureInitialize) {
 }
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
-    if (t) { backend_texture_destroyed(t); free(t); }
+    if (t) {
+        static int nlog;
+        if (g_submit_thread && kernel_current_thread() != g_submit_thread && nlog++ < 4)
+            LOG("[nvn] texture %ux%u finalized on a thread other than the submitting one (now serialised)\n", t->width, t->height);
+        backend_lock(); backend_texture_destroyed(t); free(t); backend_unlock();
+    }
     SET_HOST(A(0), 0);
 }
 NVN(nvnTextureSetDebugLabel) {
@@ -704,7 +731,7 @@ static void present_pace(int interval) {
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
-    if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    if (i >= 0 && i < w->num) { backend_lock(); backend_present(HOST(NvnTexture, w->textures[i])); backend_unlock(); }
     present_pace(w->interval);
     extern void timescan_frame(uint64_t);
     extern uint64_t renderer_present_count(void);

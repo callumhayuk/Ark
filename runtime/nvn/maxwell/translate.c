@@ -25,6 +25,11 @@
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const XfbLayout *maxwell_xfb;
 int maxwell_gmem_chunk_log2 = 30, maxwell_gmem_chunks = 8;
+// Ark (Vulkan): chunks found through a table instead of laid out linearly. Each arena has 128 chunk numbers (arena 0:
+// 0..127, arena 1: 128..255); only imported chunks (those holding NVN memory pools) get one of the maxwell_gmem_chunks
+// descriptor slots, and GMemMap's gmt table (one byte per chunk number, 0xFF: none) gives the slot. MoltenVK allows 31
+// storage buffers per stage: laid out linearly, 31 chunks reached under 2 GB of the game's mappings (2026-11-03).
+int maxwell_gmem_table = 0;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -60,6 +65,19 @@ static void sp(Str *s, const char *fmt, ...) {
 // access code is written with the token gmem_ and gmem_split indexes the array with it.
 static void gmem_open(Str *o, const char *addr) {
     uint64_t mask = (1ull << maxwell_gmem_chunk_log2) - 1;
+    if (maxwell_gmem_table) {
+        sp(o, "    { ulong gaddr = %s; ulong ga = 0ul; uint ci = 0u; bool ok = false; uint kn = 0xFFFFFFFFu;\n", addr);
+        sp(o, "      if (gaddr - gmb0 < gms0) { ulong go = gaddr - gmb0; kn = uint(go >> %d); ga = go & 0x%llxul; }\n",
+           maxwell_gmem_chunk_log2, (unsigned long long)mask);
+        sp(o, "      else if (gaddr - gmb1 < gms1) { ulong go = gaddr - gmb1; kn = 128u + uint(go >> %d); ga = go & 0x%llxul; }\n",
+           maxwell_gmem_chunk_log2, (unsigned long long)mask);
+        sp(o, "      if (kn < 256u) { ci = (gmt[kn >> 4u][(kn >> 2u) & 3u] >> ((kn & 3u) * 8u)) & 0xFFu; ok = ci < %du; }\n",
+           maxwell_gmem_chunks);
+        // (a slot's buffer may start inside its chunk: arena 0 imports only the pools' pages. gmo: that offset)
+        sp(o, "      if (ok) { uint so = gmo[ci >> 2u][ci & 3u]; if (ga < ulong(so)) ok = false; else ga -= ulong(so); }\n");
+        sp(o, "      if (!ok) ci = 0u;\n");
+        return;
+    }
     sp(o, "    { ulong gaddr = %s; ulong ga = 0ul; uint ci = 0u; bool ok = false;\n", addr);
     sp(o, "      if (gaddr - gmb0 < gms0) { ulong go = gaddr - gmb0; ci = uint(go >> %d); ga = go & 0x%llxul; ok = true; }\n",
        maxwell_gmem_chunk_log2, (unsigned long long)mask);
@@ -1987,7 +2005,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     {
         sp(&s, "layout(std430, set = %d, binding = 0) %sbuffer GMem { uint w[]; } gmem_[%d];\n", GMEM_SET,
            c->uses_gmem_store ? "" : "readonly ", maxwell_gmem_chunks);
-        sp(&s, "layout(std140, set = %d, binding = 1) uniform GMemMap { uvec4 gmm[3]; };\n", GMEM_SET);
+        if (maxwell_gmem_table) sp(&s, "layout(std140, set = %d, binding = 1) uniform GMemMap { uvec4 gmm[3]; uvec4 gmt[16]; uvec4 gmo[32]; };\n", GMEM_SET);
+        else sp(&s, "layout(std140, set = %d, binding = 1) uniform GMemMap { uvec4 gmm[3]; };\n", GMEM_SET);
         sp(&s, "#define gmb0 (uint64_t(gmm[0].y) << 32 | uint64_t(gmm[0].x))\n#define gms0 (uint64_t(gmm[0].w) << 32 | uint64_t(gmm[0].z))\n");
         sp(&s, "#define gmb1 (uint64_t(gmm[1].y) << 32 | uint64_t(gmm[1].x))\n#define gms1 (uint64_t(gmm[1].w) << 32 | uint64_t(gmm[1].z))\n");
     }
@@ -1998,7 +2017,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (info->uses_xfb) sp(&s, "layout(std140, set = 0, binding = %d) uniform XfbInfo { uvec4 xfbq[5]; };\n", XFB_BINDING);
     bool tint = stage == STAGE_FRAGMENT && !dbg && (c->omap_target & 0x7) == 0x7 && (!key || key->rt_kind[0] == 0);
     if (tint) {
-        sp(&s, "layout(std140, set = %d, binding = 19) uniform Tint { vec4 ltint[2]; };\n", set);
+        // (ltint[2]: Ark's alpha test, NVN's fixed-function one: x = function, y = reference; exec.c draw_)
+        sp(&s, "layout(std140, set = %d, binding = 19) uniform Tint { vec4 ltint[3]; };\n", set);
         info->uses_tint = true;
     }
     for (int i = 0; i < info->ntex; i++) {
@@ -2092,9 +2112,17 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 r++;
             }
         }
-        if (tint)
+        if (tint) {
             sp(&s, "  if (ltint[0].w > 0.0f) { vec3 g = c0.rgb; float l = dot(g, vec3(0.299f, 0.587f, 0.114f));\n"
                    "    c0.rgb = mix(g, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n");
+            // NVN alpha test (nvnColorStateSetAlphaTest + nvnCommandBufferSetAlphaRef): 1 never, 2 less, 3 equal,
+            // 4 lequal, 5 greater, 6 notequal, 7 gequal (8 always: x = 0, off). Vulkan has none: the UI draws that
+            // overwrite with ONE / ZERO blending (the area-name reveal) rely on it to drop their transparent texels.
+            sp(&s, "  if (ltint[2].x > 0.5f) { float aa = c0.a, ar = ltint[2].y; uint af = uint(ltint[2].x + 0.5f);\n"
+                   "    bool ap = af == 2u ? aa < ar : af == 3u ? aa == ar : af == 4u ? aa <= ar : af == 5u ? aa > ar :\n"
+                   "              af == 6u ? aa != ar : af == 7u ? aa >= ar : false;\n"
+                   "    if (!ap) discard; }\n");
+        }
         if (c->omap_depth) {
             if (c->reg_used[r + 1]) sp(&s, "  gl_FragDepth = as_f(r%d);\n", r + 1);
             else sp(&s, "  gl_FragDepth = gl_FragCoord.z;\n");

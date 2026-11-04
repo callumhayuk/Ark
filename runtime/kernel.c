@@ -28,6 +28,7 @@
 
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
 static __thread KThread *t_cur;
+void (*g_discard_hook)(uint64_t addr, uint64_t size);  // (nvn/vulkan/exec.c gmem_discard_check)
 
 // ------------------------------------------------------------------ handle table
 #define MAX_HANDLES 4096
@@ -884,6 +885,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         region_carve(x[0], x[1]);
         phys_gen++;
         pthread_mutex_unlock(&phys_lock);
+        if (g_discard_hook) g_discard_hook(x[0], x[1]);  // (Vulkan backend: warns if an import covers these pages)
         plat_discard(x[0], x[1]);  // a later map of these pages must see zeroes
         x[0] = R_OK;
         break;

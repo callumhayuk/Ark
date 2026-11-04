@@ -24,3 +24,5 @@ __pycache__/
 .deps/
 generated-*/
 build-*/
+# the player's settings (runtime/settings.c)
+ark.ini
